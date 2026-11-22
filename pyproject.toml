@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nooshare-annual-semi-corpus"
+version = "0.1.0"
+description = "Independent registry and quality management for the A-share annual and semi-annual Markdown corpus."
+requires-python = ">=3.11"
+dependencies = [
+    "typer>=0.12.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+]
+
+[project.scripts]
+nooshare-annual-semi-corpus = "annual_semi_corpus.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["annual_semi_corpus"]
