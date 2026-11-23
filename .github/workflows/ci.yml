@@ -93,7 +93,9 @@ jobs:
           bucket = field("rustfs_bucket")
 
           psk_file = work_dir / "k-ci.psk"
-          psk_file.write_text("k-ci:" + psk_hex + "\n", encoding="utf-8")
+          # stunnel_psk is already the complete "identity:hex" form (k-ci:<64hex>).
+          # Do NOT prepend the identity again or the PSK handshake will fail.
+          psk_file.write_text(psk_hex + "\n", encoding="utf-8")
           os.chmod(psk_file, 0o600)
 
           pid_file = work_dir / "stunnel.pid"
