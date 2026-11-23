@@ -8,7 +8,7 @@ import types
 
 import pytest
 
-from annual_semi_corpus.adapters import fetch_rows, list_published_keys
+from annual_semi_corpus.adapters import fetch_rows, list_published_objects
 
 
 class _ThirdPartyError(Exception):
@@ -54,7 +54,7 @@ def test_rustfs_error_hides_original_message(monkeypatch):
     monkeypatch.setitem(sys.modules, "botocore.config", fake_config)
 
     with pytest.raises(RuntimeError) as caught:
-        list_published_keys("http://endpoint", "ak", "sk", "bucket", "published/")
+        list_published_objects("http://endpoint", "ak", "sk", "bucket", "published/")
 
     message = str(caught.value)
     assert "leakme" not in message

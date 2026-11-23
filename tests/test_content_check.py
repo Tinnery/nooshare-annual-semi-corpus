@@ -1,6 +1,6 @@
 """Pure Markdown content checks used by the unified CLI check."""
 
-from annual_semi_corpus.core import ExpectedEntry, inspect_markdown
+from annual_semi_corpus.core import ExpectedEntry, inspect_markdown, select_content_sample
 
 
 def _entry(year=2023, period=4, code="000001"):
@@ -110,3 +110,24 @@ def test_invalid_utf8_is_reported_without_text_scanning():
     result = inspect_markdown(_entry().key, _entry(), b"\xff\xfe\xfa")
     assert not result.readable
     assert [finding.rule for finding in result.findings] == ["invalid_utf8"]
+
+def test_content_sample_is_deterministic_and_stratified_by_report_year_and_period():
+    expected = {}
+    keys = []
+    for year, period in ((2022, 4), (2023, 2), (2023, 4)):
+        for index in range(5):
+            code = f"{index + 1:06d}"
+            key = f"published/{code}/{code}_{year}_{period}.md"
+            expected[key] = ExpectedEntry(code, key, year, period)
+            keys.append(key)
+
+    first = select_content_sample(expected, keys, per_group=2)
+    second = select_content_sample(expected, keys, per_group=2)
+
+    assert first == second
+    assert len(first) == 6
+    assert len(set((expected[key].year, expected[key].period) for key in first)) == 3
+    for group in ((2022, 4), (2023, 2), (2023, 4)):
+        assert sum((expected[key].year, expected[key].period) == group for key in first) == 2
+
+

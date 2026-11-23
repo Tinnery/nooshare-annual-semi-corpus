@@ -97,14 +97,15 @@ def query_expected_from_pub_date(
 # --- RustFS S3 adapter (read-only) ------------------------------------------
 
 
-def list_published_keys(
+def list_published_objects(
     endpoint: str,
     access_key: str,
     secret_key: str,
     bucket: str,
     prefix: str,
-) -> set[str]:
-    """只读列举 RustFS prefix 下所有 key（list_objects_v2 自动翻页）。"""
+) -> dict[str, Optional[int]]:
+    """只读列举 RustFS prefix 下的对象 Key 与 Size（list_objects_v2 自动翻页）。"""
+
     try:
         import boto3
         import botocore.config
@@ -120,7 +121,7 @@ def list_published_keys(
             proxies={"http": None, "https": None},  # 本地/内网 RustFS 不走代理
         ),
     )
-    keys: set[str] = set()
+    objects: dict[str, Optional[int]] = {}
     token: Optional[str] = None
     try:
         while True:
@@ -130,7 +131,7 @@ def list_published_keys(
             response = client.list_objects_v2(**kwargs)
             for item in response.get("Contents", []):
                 if item.get("Key"):
-                    keys.add(item["Key"])
+                    objects[item["Key"]] = item.get("Size")
             if not response.get("IsTruncated"):
                 break
             next_token = response.get("NextContinuationToken")
@@ -143,7 +144,7 @@ def list_published_keys(
         raise RuntimeError(
             f"RustFS 列举失败（bucket={bucket}, prefix={prefix}）：{type(exc).__name__}"
         ) from exc
-    return keys
+    return objects
 
 
 # --- Local report adapter ---------------------------------------------------
@@ -199,6 +200,10 @@ def write_report(
             "missing": missing_rows,
             "orphans": orphan_rows,
             "content": {
+                "matched": content.matched_count if content else 0,
+                "sampled": content.sampled_count if content else 0,
+                "sample_per_group": content.sample_per_group if content else 0,
+                "sample_group_count": content.sample_group_count if content else 0,
                 "attempted": content.attempted_count if content else 0,
                 "readable": content.readable_count if content else 0,
                 "clean": content.clean_count if content else 0,

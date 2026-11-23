@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Optional
 
@@ -90,8 +92,12 @@ class MarkdownInspection:
 
 @dataclass(frozen=True)
 class ContentCheckResult:
-    """Aggregated content checks from one check invocation."""
+    """Full metadata checks plus a deterministic, stratified content sample."""
 
+    matched_count: int
+    sampled_count: int
+    sample_per_group: int
+    sample_group_count: int
     attempted_count: int
     readable_count: int
     clean_count: int
@@ -146,6 +152,40 @@ def compare_keys(
         missing=missing,
         orphans=orphans,
     )
+
+
+
+def select_content_sample(
+    expected: dict[str, ExpectedEntry],
+    matched_keys: list[str],
+    *,
+    per_group: int = 10,
+) -> tuple[str, ...]:
+    """Select a stable sample within each (report year, annual/semiannual) group.
+
+    SHA-256 is used only to produce a deterministic pseudo-random ordering of
+    object keys. It is not a content-integrity check and no expected file hash
+    is inferred or stored here.
+    """
+    if per_group <= 0:
+        raise ValueError("per_group must be positive")
+
+    groups: dict[tuple[Optional[int], Optional[int]], list[str]] = defaultdict(list)
+    for key in matched_keys:
+        entry = expected.get(key)
+        if entry is None:
+            continue
+        groups[(entry.year, entry.period)].append(key)
+
+    selected: list[str] = []
+    for group in sorted(groups, key=lambda value: (value[0] is None, value[0] or 0, value[1] or 0)):
+        candidates = sorted(
+            groups[group],
+            key=lambda key: (hashlib.sha256(key.encode("utf-8")).digest(), key),
+        )
+        selected.extend(candidates[:per_group])
+
+    return tuple(sorted(selected))
 
 
 def _report_identity(text: str) -> tuple[int, int] | None:

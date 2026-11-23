@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from annual_semi_corpus.adapters import (
-    list_published_keys,
+    list_published_objects,
     query_expected_from_pub_date,
     read_published_objects,
 )
@@ -17,6 +17,7 @@ from annual_semi_corpus.core import (
     ExpectedEntry,
     compare_keys,
     inspect_markdown,
+    select_content_sample,
 )
 
 
@@ -44,7 +45,8 @@ def run_check(
 ) -> CheckOutcome:
     """Run coverage and content checks for every expected object that exists."""
     expected = query_expected_from_pub_date(dsn, "ju", prefix, year_min, year_max, limit)
-    full_keys = list_published_keys(endpoint, access_key, secret_key, bucket, prefix)
+    object_sizes = list_published_objects(endpoint, access_key, secret_key, bucket, prefix)
+    full_keys = set(object_sizes)
 
     has_pub_date_filter = year_min is not None or year_max is not None
     result = compare_keys(set(expected), full_keys, report_orphans=not has_pub_date_filter)
@@ -64,12 +66,35 @@ def run_check(
     )
     rule_counts = {name: 0 for name in rule_names}
     severity_counts = {"error": 0, "suspect": 0, "advisory": 0, "execution": 0}
-    findings: list[ContentFinding] = []
+    matched_keys = sorted(set(expected) & full_keys)
+    empty_findings = [
+        ContentFinding(key, "empty", "error", "RustFS 对象 Size 为 0 字节")
+        for key in matched_keys
+        if object_sizes.get(key) == 0
+    ]
+    sample_keys = select_content_sample(
+        expected,
+        [key for key in matched_keys if object_sizes.get(key) != 0],
+        per_group=10,
+    )
+    sample_groups = {
+        (expected[key].year, expected[key].period)
+        for key in sample_keys
+    }
+
+    findings: list[ContentFinding] = list(empty_findings)
+    severity_counts = {
+        "error": len(empty_findings),
+        "suspect": 0,
+        "advisory": 0,
+        "execution": 0,
+    }
+    rule_counts = {name: 0 for name in rule_names}
+    rule_counts["empty"] = len(empty_findings)
     attempted = readable = clean = year_unverified = 0
 
-    matched_keys = sorted(set(expected) & full_keys)
     for key, data, read_error in read_published_objects(
-        endpoint, access_key, secret_key, bucket, matched_keys
+        endpoint, access_key, secret_key, bucket, list(sample_keys)
     ):
         attempted += 1
         if read_error is not None:
@@ -96,6 +121,10 @@ def run_check(
 
     findings.sort(key=lambda item: (item.key, item.rule))
     content = ContentCheckResult(
+        matched_count=len(matched_keys),
+        sampled_count=len(sample_keys),
+        sample_per_group=10,
+        sample_group_count=len(sample_groups),
         attempted_count=attempted,
         readable_count=readable,
         clean_count=clean,

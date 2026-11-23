@@ -122,9 +122,15 @@ def check(
     content = outcome.content
     severities = content.severity_counts
     typer.echo("内容检查")
-    typer.echo(f"  已检查对象 : {content.attempted_count}")
-    typer.echo(f"  可读取对象 : {content.readable_count}")
-    typer.echo(f"  未识别年度 : {content.year_unverified_count}")
+    typer.echo(f"  命中对象数 : {content.matched_count}（全量 Size 元数据核验）")
+    typer.echo(
+        f"  正文抽样数 : {content.sampled_count}（按报告年度×报告类型分组，每组最多 {content.sample_per_group} 份）"
+    )
+    typer.echo(f"  样本分组数 : {content.sample_group_count}")
+    typer.echo(f"  已尝试读取 : {content.attempted_count}")
+    typer.echo(f"  样本可读取 : {content.readable_count}")
+    typer.echo(f"  样本无问题 : {content.clean_count}")
+    typer.echo(f"  样本未识别年度 : {content.year_unverified_count}")
     typer.echo(
         "  内容问题   : "
         f"error={severities['error']}, "
@@ -147,6 +153,6 @@ def check(
             raise typer.Exit(code=1) from exc
         typer.echo(f"报告已写出：{output}")
 
-    # A read failure means the content check did not complete for every matched object.
-    # Content findings are reported separately; the first rollout establishes their baseline.
+    # A read failure means the selected content sample did not complete.
+    # Full coverage and object-size checks still run over the entire selected scope.
     raise typer.Exit(code=1 if severities["execution"] else 0)
