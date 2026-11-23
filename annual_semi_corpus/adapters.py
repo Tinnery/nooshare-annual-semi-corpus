@@ -1,7 +1,7 @@
 """Outbound adapters for the corpus check command.
 
 Each adapter owns exactly one external resource: PostgreSQL (read-only),
-RustFS S3 (read-only listing), and the local report file. Heavy third-party
+RustFS S3 (read-only listing and object reads), and the local report file. Heavy third-party
 imports are lazy so ``--help`` and pure-function tests stay offline.
 """
 
@@ -13,7 +13,7 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
-from annual_semi_corpus.core import (\n    CheckResult, ContentCheckResult, ExpectedEntry, build_md_key, period_to_slot,\n)
+from annual_semi_corpus.core import CheckResult, ContentCheckResult, ExpectedEntry, build_md_key, period_to_slot
 
 _SAFE_SCHEMA_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -218,7 +218,7 @@ def write_report(
             writer.writerows(orphan_rows)
             writer.writerows(content_findings)
     else:
-        raise ValueError(f"--output 仅支持 .json / .csv，收到：{target.suffix or '(无扩展名)'})
+        raise ValueError(f"--output 仅支持 .json / .csv，收到：{target.suffix or '(无扩展名)'}")
 
 
 # --- RustFS object reader ----------------------------------------------------
@@ -241,11 +241,15 @@ def read_published_objects(
     """
     from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
-    import boto3
-    import botocore.config
+    try:
+        import boto3
+        import botocore.config
+    except ImportError as exc:
+        raise RuntimeError("缺少 boto3 依赖，请先安装：boto3>=1.34") from exc
 
     worker_count = max(1, workers)
-    client = boto3.client(
+    try:
+        client = boto3.client(
         "s3",
         endpoint_url=endpoint,
         aws_access_key_id=access_key,
@@ -257,7 +261,9 @@ def read_published_objects(
             read_timeout=60,
             retries={"max_attempts": 2, "mode": "standard"},
         ),
-    )
+        )
+    except Exception as exc:
+        raise RuntimeError(f"RustFS 对象读取初始化失败（{type(exc).__name__}）") from exc
 
     def read_one(key: str):
         try:

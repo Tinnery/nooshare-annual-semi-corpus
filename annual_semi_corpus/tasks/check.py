@@ -86,7 +86,7 @@ def run_check(
             readable += 1
         if not inspection.year_verified:
             year_unverified += 1
-        if not inspection.findings:
+        if not inspection.findings and inspection.year_verified:
             clean += 1
         for finding in inspection.findings:
             findings.append(finding)

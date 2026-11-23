@@ -93,7 +93,7 @@ def test_annual_missing_terminal_sections_is_suspect_not_hard_failure():
 def test_annual_tail_drift_is_advisory():
     text = (
         "# 2023年年度报告\n备查文件目录\n审计报告\n财务报表\n"
-        + "正文。" * 100
+        + "正文。" * 2000
     ).encode()
     finding = _rules(text)["annual_tail_drift"]
     assert finding.severity == "advisory"
