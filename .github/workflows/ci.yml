@@ -31,12 +31,16 @@ jobs:
   infra-check:
     name: Infra check (stunnel tunnel)
     needs: unit-test
-    # Fork PRs must never receive secrets, so all pull_request events are skipped.
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    # Real infrastructure credentials must never be injected automatically.
+    # Only an explicit manual dispatch may run this job. Add Required reviewers
+    # on the `corpus-infra` GitHub Environment to gate who can trigger it.
+    if: github.event_name == 'workflow_dispatch'
+    environment: corpus-infra
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      NOOSHARE_INFRA: ${{ secrets.NOOSHARE_INFRA }}
+    # NOOSHARE_INFRA is intentionally NOT set at job level: only the single
+    # Prepare step below receives it, so checkout / setup-uv / install steps
+    # never inherit the raw infrastructure secret.
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -61,6 +65,9 @@ jobs:
       #   into job logs and persists them for later steps. The runtime env file
       #   is `source`d privately in the single step needing the credentials.
       - name: Prepare tunnel config, PSK file and private runtime env file
+        # Secret scope is limited to this step only (least privilege).
+        env:
+          NOOSHARE_INFRA: ${{ secrets.NOOSHARE_INFRA }}
         run: |
           python3 - <<'PY'
           """Write tunnel material from NOOSHARE_INFRA; print no secret values."""
@@ -100,11 +107,10 @@ jobs:
 
           pid_file = work_dir / "stunnel.pid"
           conf_file = work_dir / "stunnel.conf"
-          log_file = work_dir / "stunnel.log"
+          # No debug/output directives: detailed stunnel logs must not be
+          # emitted or filtered into Actions logs. Default (minimal) logging.
           conf_lines = [
               "pid = " + str(pid_file),
-              "debug = 7",
-              "output = " + str(log_file),
               "",
               "[pg]",
               "client = yes",
@@ -189,19 +195,15 @@ jobs:
           # shellcheck disable=SC1090
           source "$RUNNER_TEMP/corpus-ci/runtime.env"
           set +a
-          uv run nooshare-annual-semi-corpus check --limit 5
-
-      - name: Dump stunnel diagnostics on failure
-        if: failure()
-        run: |
-          # stunnel debug logs contain no PSK hex (only the identity name and
-          # handshake/SNI outcomes), but filter defensively anyway.
-          log="$RUNNER_TEMP/corpus-ci/stunnel.log"
-          if [ -f "$log" ]; then
-            grep -iE "sni|handshake|psk|error|fail|close|reject" "$log" \
-              | grep -viE "[0-9a-f]{32,}|k-ci:" \
-              | tail -40 || true
-          fi
+          # This is a public repository: Actions logs are public. Keep the
+          # corpus gap detail (missing object keys / internal data state) out
+          # of the log; capture full output privately and echo only counts.
+          out="$RUNNER_TEMP/corpus-ci/check.out"
+          status=0
+          uv run nooshare-annual-semi-corpus check --limit 5 > "$out" 2>&1 || status=$?
+          # Echo only aggregate counts / error lines; corpus gap keys stay private.
+          grep -E "check 摘要|schema |期望对象数|实有对象数|缺失数|孤儿数|错误" "$out" || true
+          exit "$status"
 
       - name: Stop stunnel and remove secret material
         if: always()
@@ -214,4 +216,4 @@ jobs:
               kill "$pid" 2>/dev/null || true
             fi
           fi
-          rm -f "$pid_file" "$work_dir/stunnel.conf" "$work_dir/k-ci.psk" "$work_dir/runtime.env" "$work_dir/stunnel.log"
+          rm -f "$pid_file" "$work_dir/stunnel.conf" "$work_dir/k-ci.psk" "$work_dir/runtime.env" "$work_dir/check.out"

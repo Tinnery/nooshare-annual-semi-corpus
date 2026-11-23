@@ -49,8 +49,9 @@ def fetch_rows(dsn: str, sql: str, params: list[Any], source: str) -> list[tuple
                 cur.execute(sql, params)
                 return list(cur.fetchall())
     except Exception as exc:
-        # 不回显 dsn（可能含凭据），只报异常类型与消息。
-        raise RuntimeError(f"PG 查询失败（{source}）：{type(exc).__name__}: {exc}") from exc
+        # Fail closed: 第三方异常原文可能夹带 DSN / 连接参数，一律不回显。
+        # 只保留固定错误分类 + 异常类型名；详细诊断留在受控本地环境。
+        raise RuntimeError(f"PG 查询失败（{source}）：{type(exc).__name__}") from exc
 
 
 def query_expected_from_pub_date(
@@ -137,8 +138,10 @@ def list_published_keys(
                 break
             token = next_token
     except Exception as exc:
+        # Fail closed: botocore 异常原文可能夹带 endpoint / 请求细节，
+        # 一律不回显。只保留固定分类 + 异常类型名（bucket/prefix 非凭据）。
         raise RuntimeError(
-            f"RustFS 列举失败（bucket={bucket}, prefix={prefix}）：{type(exc).__name__}: {exc}"
+            f"RustFS 列举失败（bucket={bucket}, prefix={prefix}）：{type(exc).__name__}"
         ) from exc
     return keys
 
