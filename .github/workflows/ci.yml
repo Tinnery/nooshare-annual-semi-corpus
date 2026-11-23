@@ -31,12 +31,11 @@ jobs:
   infra-check:
     name: Infra check (stunnel tunnel)
     needs: unit-test
-    # Real infrastructure credentials must never be injected automatically.
-    # Only an explicit manual dispatch by a write-permission principal may run
-    # this job. The repo has a single trusted maintainer (agent); no additional
-    # Environment reviewer gate is needed while that holds. Re-evaluate if a
+    # Run on push to main (single trusted agent writer) and manual dispatch.
+    # Pull requests are excluded: fork PRs must never receive secrets, and
+    # this job requires real infrastructure credentials. Re-evaluate if a
     # second writer or an untrusted contributor is ever added.
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # NOOSHARE_INFRA is intentionally NOT set at job level: only the single
