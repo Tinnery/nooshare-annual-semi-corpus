@@ -13,7 +13,7 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
-from annual_semi_corpus.core import CheckResult, ExpectedEntry, build_md_key, period_to_slot
+from annual_semi_corpus.core import (\n    CheckResult, ContentCheckResult, ExpectedEntry, build_md_key, period_to_slot,\n)
 
 _SAFE_SCHEMA_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -166,11 +166,25 @@ def write_report(
     schema: str,
     bucket: str,
     prefix: str,
+    content: Optional[ContentCheckResult] = None,
 ) -> None:
     """按扩展名写出 .json / .csv 清单；只写本地文件，不碰 PG / RustFS。"""
     target = Path(path)
     missing_rows = [_report_row(expected.get(key), key, "missing") for key in result.missing]
     orphan_rows = [_report_row(None, key, "orphan") for key in result.orphans]
+    content_findings = []
+    if content is not None:
+        for finding in content.findings:
+            entry = expected.get(finding.key)
+            content_findings.append({
+                "kind": finding.rule,
+                "code": entry.code if entry else "",
+                "year": entry.year if entry and entry.year is not None else "",
+                "period": entry.period if entry and entry.period is not None else "",
+                "key": finding.key,
+                "severity": finding.severity,
+                "reason": finding.detail,
+            })
     if target.suffix.lower() == ".json":
         payload = {
             "schema": schema,
@@ -184,13 +198,97 @@ def write_report(
             },
             "missing": missing_rows,
             "orphans": orphan_rows,
+            "content": {
+                "attempted": content.attempted_count if content else 0,
+                "readable": content.readable_count if content else 0,
+                "clean": content.clean_count if content else 0,
+                "year_unverified": content.year_unverified_count if content else 0,
+                "rule_counts": content.rule_counts if content else {},
+                "severity_counts": content.severity_counts if content else {},
+                "findings": content_findings,
+            },
         }
         target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     elif target.suffix.lower() == ".csv":
         with target.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=["kind", "code", "year", "period", "key"])
+            fields = ["kind", "code", "year", "period", "key", "severity", "reason"]
+            writer = csv.DictWriter(handle, fieldnames=fields)
             writer.writeheader()
             writer.writerows(missing_rows)
             writer.writerows(orphan_rows)
+            writer.writerows(content_findings)
     else:
-        raise ValueError(f"--output 仅支持 .json / .csv，收到：{target.suffix or '(无扩展名)'}")
+        raise ValueError(f"--output 仅支持 .json / .csv，收到：{target.suffix or '(无扩展名)'})
+
+
+# --- RustFS object reader ----------------------------------------------------
+
+
+def read_published_objects(
+    endpoint: str,
+    access_key: str,
+    secret_key: str,
+    bucket: str,
+    keys: list[str],
+    *,
+    workers: int = 4,
+):
+    """Yield (key, bytes, error_type) with bounded concurrent GET requests.
+
+    The S3 client is shared across a small worker pool. At most twice the
+    worker count is in flight, avoiding one Future per object for large corpora.
+    Error messages are reduced to exception type names before leaving the adapter.
+    """
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+    import boto3
+    import botocore.config
+
+    worker_count = max(1, workers)
+    client = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        config=botocore.config.Config(
+            proxies={"http": None, "https": None},
+            max_pool_connections=worker_count,
+            connect_timeout=10,
+            read_timeout=60,
+            retries={"max_attempts": 2, "mode": "standard"},
+        ),
+    )
+
+    def read_one(key: str):
+        try:
+            response = client.get_object(Bucket=bucket, Key=key)
+            body = response["Body"]
+            try:
+                data = body.read()
+            finally:
+                body.close()
+            return key, data, None
+        except Exception as exc:
+            return key, None, type(exc).__name__
+
+    iterator = iter(keys)
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        pending = set()
+
+        def fill_pending() -> None:
+            while len(pending) < worker_count * 2:
+                try:
+                    key = next(iterator)
+                except StopIteration:
+                    return
+                pending.add(executor.submit(read_one, key))
+
+        fill_pending()
+        while pending:
+            completed, pending_remaining = wait(
+                pending, return_when=FIRST_COMPLETED
+            )
+            pending = set(pending_remaining)
+            for future in completed:
+                yield future.result()
+            fill_pending()

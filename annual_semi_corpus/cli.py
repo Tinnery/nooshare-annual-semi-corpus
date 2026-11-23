@@ -44,7 +44,7 @@ def check(
     year_max: Optional[int] = typer.Option(None, "--year-max", help="按 pub_date 年份过滤：上界（含）"),
     limit: Optional[int] = typer.Option(None, "--limit", help="只检查前 N 个 code（调试用）"),
     output: Optional[str] = typer.Option(
-        None, "--output", "-o", help="缺失清单输出路径（.json / .csv）；默认仅打印摘要"
+        None, "--output", "-o", help="检查问题明细输出路径（.json / .csv）；默认仅打印摘要"
     ),
 ) -> None:
     """只读检查 ju.pub_date 期望清单与 RustFS published/ md 库的完整性。
@@ -119,12 +119,34 @@ def check(
     else:
         typer.echo("缺失样本：无")
 
+    content = outcome.content
+    severities = content.severity_counts
+    typer.echo("内容检查")
+    typer.echo(f"  已检查对象 : {content.attempted_count}")
+    typer.echo(f"  可读取对象 : {content.readable_count}")
+    typer.echo(f"  未识别年度 : {content.year_unverified_count}")
+    typer.echo(
+        "  内容问题   : "
+        f"error={severities['error']}, "
+        f"suspect={severities['suspect']}, "
+        f"advisory={severities['advisory']}, "
+        f"read_error={severities['execution']}"
+    )
+    for rule, count in content.rule_counts.items():
+        if count:
+            typer.echo(f"  {rule:<24}: {count}")
+
     if output:
         try:
-            write_report(output, result, outcome.expected, "ju", settings.bucket, settings.prefix)
+            write_report(
+                output, result, outcome.expected, "ju",
+                settings.bucket, settings.prefix, content,
+            )
         except (OSError, ValueError) as exc:
             typer.echo(f"错误：写出报告失败：{exc}", err=True)
             raise typer.Exit(code=1) from exc
         typer.echo(f"报告已写出：{output}")
 
-    raise typer.Exit(code=0)
+    # A read failure means the content check did not complete for every matched object.
+    # Content findings are reported separately; the first rollout establishes their baseline.
+    raise typer.Exit(code=1 if severities["execution"] else 0)

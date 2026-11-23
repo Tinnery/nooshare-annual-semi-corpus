@@ -62,3 +62,45 @@ def test_rustfs_error_hides_original_message(monkeypatch):
     assert "signed" not in message
     assert "_ThirdPartyError" in message
     assert "bucket=bucket" in message
+
+
+
+def test_read_published_objects_reads_bytes_and_masks_errors(monkeypatch):
+    """GET adapter returns bytes and exposes only the exception type on failure."""
+    from annual_semi_corpus.adapters import read_published_objects
+
+    class Body:
+        def __init__(self, value):
+            self.value = value
+
+        def read(self):
+            if isinstance(self.value, Exception):
+                raise self.value
+            return self.value
+
+        def close(self):
+            pass
+
+    class Client:
+        def get_object(self, *, Bucket, Key):
+            if Key.endswith("bad.md"):
+                return {"Body": Body(_ThirdPartyError("secret=must-not-escape"))}
+            return {"Body": Body(b"# markdown")}
+
+    fake_boto3 = types.ModuleType("boto3")
+    fake_boto3.client = lambda *args, **kwargs: Client()
+    fake_config = types.ModuleType("botocore.config")
+    fake_config.Config = lambda **kwargs: None
+    fake_botocore = types.ModuleType("botocore")
+    fake_botocore.config = fake_config
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+    monkeypatch.setitem(sys.modules, "botocore", fake_botocore)
+    monkeypatch.setitem(sys.modules, "botocore.config", fake_config)
+
+    rows = list(read_published_objects(
+        "http://endpoint", "ak", "sk", "bucket",
+        ["published/good.md", "published/bad.md"], workers=2,
+    ))
+    results = {key: (data, error) for key, data, error in rows}
+    assert results["published/good.md"] == (b"# markdown", None)
+    assert results["published/bad.md"] == (None, "_ThirdPartyError")
