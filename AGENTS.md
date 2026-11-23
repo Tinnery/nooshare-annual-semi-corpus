@@ -40,6 +40,7 @@
 | `inventory` | Current | 扫描实际 Markdown，建立语料清单 |
 | `assess` | Current | 对指定清单进行质量评估 |
 | `diff` | Current | 比较两次语料清单或质量评估的变化 |
+| `check` | Current | 只读检查 PG 期望清单（ju/public schema 的 code 与 pub dates）与 RustFS published/ md 库的完整性 |
 
 ## Operational Boundaries
 
@@ -49,6 +50,7 @@
 - **凭据操作**（轮换、删除）必须按 Workenv 凭据隔离规则执行
 - **正式发布**必须获得明确授权，并在 commit trailer 用 `Authorized-by:` 留痕
 - **破坏性操作**（删除生产数据、重建 Schema）前必须确认恢复点
+- `check` 为只读巡检，仍需明确环境标识（DEV/VALIDATION/STABLE），不因只读而省略授权判断
 
 ## Test & Verification
 
@@ -72,6 +74,8 @@ uv run pytest
 |--------|------|--------|
 | 结构纪律（Git 唯一记录、平铺、按需建目录、AGENTS.md 职责） | nooshare-workenv | `AGENTS.md` |
 | 文档体系归属与维护边界 | nooshare-design | `nooshare-design/doc-index/nooshare-annual-semi-corpus.md` |
+| 期望清单（code list 与 pub dates） | nooshare-annual-semi（数据生产者） | `ju.pub_date` / `ju.stocks` 或 `public.canonical_symbol`（经 `workspace.yaml` 定位其契约） |
+| md 库对象与惰性加载（RustFS published/） | nooshare-annual-semi | `annual_semi/objectstore/rustfs.py`（published key 规律） |
 
 通过 `workspace.yaml` 定位目标 Repo 的 checkout 路径后读取对应文件。
 
