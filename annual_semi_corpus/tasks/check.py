@@ -43,7 +43,7 @@ def run_check(
     year_max: Optional[int],
     limit: Optional[int],
 ) -> CheckOutcome:
-    """Run coverage and content checks for every expected object that exists."""
+    """Run full coverage/size checks plus stratified sample content checks."""
     expected = query_expected_from_pub_date(dsn, "ju", prefix, year_min, year_max, limit)
     object_sizes = list_published_objects(endpoint, access_key, secret_key, bucket, prefix)
     full_keys = set(object_sizes)
@@ -64,8 +64,6 @@ def run_check(
         "annual_terminal_missing",
         "annual_tail_drift",
     )
-    rule_counts = {name: 0 for name in rule_names}
-    severity_counts = {"error": 0, "suspect": 0, "advisory": 0, "execution": 0}
     matched_keys = sorted(set(expected) & full_keys)
     empty_findings = [
         ContentFinding(key, "empty", "error", "RustFS 对象 Size 为 0 字节")

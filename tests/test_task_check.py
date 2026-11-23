@@ -13,7 +13,7 @@ def test_run_check_reads_only_expected_objects_that_exist(monkeypatch):
         missing_key: ExpectedEntry("000002", missing_key, 2023, 4),
     }
     monkeypatch.setattr(check, "query_expected_from_pub_date", lambda *a, **k: expected)
-    monkeypatch.setattr(check, "list_published_keys", lambda *a, **k: {expected_key: 2048})
+    monkeypatch.setattr(check, "list_published_objects", lambda *a, **k: {expected_key: 2048})
 
     data = (
         "# 2023年年度报告\n" + "正文。" * 50
@@ -52,7 +52,7 @@ def test_run_check_reports_object_read_errors(monkeypatch):
     key = "published/000001/000001_2023_4.md"
     expected = {key: ExpectedEntry("000001", key, 2023, 4)}
     monkeypatch.setattr(check, "query_expected_from_pub_date", lambda *a, **k: expected)
-    monkeypatch.setattr(check, "list_published_keys", lambda *a, **k: {key: 2048})
+    monkeypatch.setattr(check, "list_published_objects", lambda *a, **k: {key: 2048})
     monkeypatch.setattr(
         check, "read_published_objects",
         lambda *a, **k: iter([(key, None, "EndpointConnectionError")]),
