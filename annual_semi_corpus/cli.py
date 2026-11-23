@@ -1,8 +1,9 @@
 """CLI for nooshare-annual-semi-corpus.
 
-Trigger + orchestration only: resolve configuration, call outbound adapters,
-combine pure results, map outcomes to output and exit status. Business logic
-lives in core.py; IO lives in adapters.py; configuration lives in config.py.
+Trigger layer only: parse parameters, validate input, call the check task,
+format output, and map outcomes to exit status. Business orchestration lives
+in tasks/check.py; pure computation in core.py; IO in adapters.py; configuration
+in config.py.
 """
 
 from __future__ import annotations
@@ -11,13 +12,9 @@ from typing import Optional
 
 import typer
 
-from annual_semi_corpus.adapters import (
-    list_published_keys,
-    query_expected_from_pub_date,
-    write_report,
-)
+from annual_semi_corpus.adapters import write_report
 from annual_semi_corpus.config import load_settings
-from annual_semi_corpus.core import compare_keys
+from annual_semi_corpus.tasks.check import run_check
 
 app = typer.Typer(
     help="Independent registry and quality management for the A-share annual and semi-annual Markdown corpus.",
@@ -79,25 +76,23 @@ def check(
         raise typer.Exit(code=1)
 
     try:
-        expected = query_expected_from_pub_date(
-            settings.dsn, "ju", settings.prefix, year_min, year_max, limit
+        outcome = run_check(
+            dsn=settings.dsn,
+            endpoint=settings.endpoint,
+            access_key=settings.access_key,
+            secret_key=settings.secret_key,
+            bucket=settings.bucket,
+            prefix=settings.prefix,
+            year_min=year_min,
+            year_max=year_max,
+            limit=limit,
         )
     except (RuntimeError, ValueError) as exc:
-        typer.echo(f"错误：读取 PG 期望清单失败：{exc}", err=True)
+        typer.echo(f"错误：检查失败：{exc}", err=True)
         raise typer.Exit(code=1) from exc
 
-    try:
-        full_keys = list_published_keys(
-            settings.endpoint, settings.access_key, settings.secret_key, settings.bucket, settings.prefix
-        )
-    except RuntimeError as exc:
-        typer.echo(f"错误：读取 RustFS 清单失败：{exc}", err=True)
-        raise typer.Exit(code=1) from exc
-
-    has_pub_date_filter = year_min is not None or year_max is not None
-    result = compare_keys(
-        set(expected), full_keys, report_orphans=not has_pub_date_filter
-    )
+    result = outcome.result
+    has_pub_date_filter = outcome.has_pub_date_filter
 
     typer.echo("check 摘要")
     typer.echo("  schema     : ju")
@@ -126,7 +121,7 @@ def check(
 
     if output:
         try:
-            write_report(output, result, expected, "ju", settings.bucket, settings.prefix)
+            write_report(output, result, outcome.expected, "ju", settings.bucket, settings.prefix)
         except (OSError, ValueError) as exc:
             typer.echo(f"错误：写出报告失败：{exc}", err=True)
             raise typer.Exit(code=1) from exc

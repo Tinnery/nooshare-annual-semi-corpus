@@ -28,7 +28,12 @@
 
 本仓库拥有：
 
-- Python 源码（`annual_semi_corpus/`），按职责拆分为：`config.py`（配置解析）、`core.py`（纯计算）、`adapters.py`（PG / RustFS / 报告 IO）、`cli.py`（trigger 与编排）
+- Python 源码（`annual_semi_corpus/`），按职责拆分为：
+  - `config.py`：配置解析
+  - `core.py`：纯计算（无 I/O）
+  - `adapters.py`：PG / RustFS / 报告 IO
+  - `cli.py`：trigger 层（参数解析、输出格式化）
+  - `tasks/`：应用编排层（协调 adapters 和 core，实现业务用例）
 - CLI 命令（`check`，唯一命令）
 - check 报告（运行时生成，不纳入版本控制）
 - 本地运行时配置（`.env`，含 PG / RustFS 凭据，被 `.gitignore` 排除，禁止提交）
