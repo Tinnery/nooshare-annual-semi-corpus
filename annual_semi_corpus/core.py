@@ -36,17 +36,26 @@ _REPORT_IDENTITY_PATTERNS = (
         r"(?P<year>19\d{2}|20\d{2})\s*年\s*"
         r"(?P<kind>半年度报告|半年报|年度报告|年报)"
     ),
+    # "XXXX年度报告"（单"年"字写法，仅年报；实测语料常见，如 "# 2025年度报告"）
+    re.compile(r"(?P<year>19\d{2}|20\d{2})年度报告"),
     re.compile(
         r"(?P<year>[零〇○一二三四五六七八九]{4})\s*年\s*"
         r"(?P<kind>半年度报告|半年报|年度报告|年报)"
     ),
 )
+# 候选行含引用句式时不算报告身份："具体可参见2019年年报""载有…2022年年度报告文本原件"
+_IDENTITY_REF_WORDS = ("参见", "详见", "载有", "文本原件", "原件")
 _CHINESE_DIGITS = {
     "零": "0", "〇": "0", "○": "0",
     "一": "1", "二": "2", "三": "3", "四": "4",
     "五": "5", "六": "6", "七": "7", "八": "8", "九": "9",
 }
-_STOCK_CODE_PATTERN = re.compile(r"(?:股票代码|证券代码)\s*[：:]?\s*(\d{6})")
+_STOCK_CODE_PATTERN = re.compile(
+    r"(?:股票代码|证券代码|公司代码)\s*[：:]?\s*(\d{6})(?!\.[A-Za-z])"
+)
+# 行内含引用性词汇的代码匹配是释义表对他司（控股股东/客户等）的引用，不参与比对；
+# 带 .SZ/.KS 等交易所后缀的代码同属引用格式，由正则负向前瞻排除
+_CODE_REF_CONTEXT_WORDS = ("控股股", "参股", "全资", "子公司", "曾用名", "客户", "供应商")
 _TERMINAL_PATTERNS = ("备查文件目录", "审计报告", "财务报表")
 _TERMINAL_MERGED = "审计报告及财务报表"
 
@@ -189,10 +198,16 @@ def select_content_sample(
 
 
 def _report_identity(text: str) -> tuple[int, int] | None:
-    """Find a report year/type in the first 5,000 characters."""
+    """Find a report year/type in the first 5,000 characters.
+
+    行内含引用句式（参见/详见/载有/原件等）的匹配是目录、备查说明或历史引用，
+    不是报告主体身份，不作为候选。
+    """
     head = text[:5000]
     candidates: list[tuple[int, int, int]] = []
     for position, line in enumerate(head.splitlines()):
+        if any(word in line for word in _IDENTITY_REF_WORDS):
+            continue
         for pattern in _REPORT_IDENTITY_PATTERNS:
             match = pattern.search(line)
             if not match:
@@ -207,7 +222,8 @@ def _report_identity(text: str) -> tuple[int, int] | None:
                 year = int(digits)
             if not 1990 <= year <= 2100:
                 continue
-            kind = 2 if match.group("kind").startswith(("半年度", "半年")) else 4
+            kind_text = match.groupdict().get("kind") or "年度报告"
+            kind = 2 if kind_text.startswith(("半年度", "半年")) else 4
             is_heading = line.lstrip().startswith("#")
             candidates.append((0 if is_heading else 1, position, year * 10 + kind))
     if not candidates:
@@ -283,14 +299,28 @@ def inspect_markdown(key: str, entry: ExpectedEntry, data: bytes) -> MarkdownIns
                 f"正文识别为{content_name}，对象 Key 对应{expected_name}",
             )
 
-    code_matches = set(_STOCK_CODE_PATTERN.findall(text[:5000]))
-    if len(code_matches) == 1:
-        content_code = next(iter(code_matches))
-        if content_code != entry.code:
+    # 证券代码比对：排除释义表/引用句（含"控股股东""曾用名"等）中的他司代码。
+    # 本公司代码出现在候选中即通过；候选不含本公司代码时，唯一候选或位置最早的
+    # 候选与对象代码不一致才报告（封面代码优先于正文后部的引用）。
+    code_hits: list[str] = []
+    for line in text[:5000].splitlines():
+        if any(word in line for word in _CODE_REF_CONTEXT_WORDS):
+            continue
+        code_hits.extend(_STOCK_CODE_PATTERN.findall(line))
+    code_candidates = set(code_hits)
+    if code_candidates and entry.code not in code_candidates:
+        if len(code_candidates) == 1:
+            content_code = code_hits[0]
             add(
                 "stock_code_mismatch",
                 "error",
                 f"正文证券代码 {content_code} 与对象代码 {entry.code} 不一致",
+            )
+        elif code_hits[0] != entry.code:
+            add(
+                "stock_code_mismatch",
+                "error",
+                f"正文证券代码 {code_hits[0]} 与对象代码 {entry.code} 不一致",
             )
 
     if entry.period == 4:

@@ -84,6 +84,82 @@ def test_explicit_stock_code_mismatch_is_reported():
     assert "stock_code_mismatch" in _rules(text)
 
 
+def test_single_nian_year_title_is_recognized():
+    """真实语料常见单年字写法（如 "# 2025年度报告"）应识别为年报身份。"""
+    text = _annual_body("# 2025年度报告")
+    result = inspect_markdown(_entry(year=2025).key, _entry(year=2025), text)
+    assert result.year_verified
+    assert "year_mismatch" not in {f.rule for f in result.findings}
+
+
+def test_single_nian_year_mismatch_is_reported():
+    entry = _entry(year=2023)
+    text = _annual_body("# 2025年度报告")
+    assert "year_mismatch" in _rules(text, entry)
+
+
+def test_reference_line_is_not_treated_as_identity():
+    """正文只有引用句式（参见…年报）时不应把引用年度当报告身份。"""
+    entry = _entry(year=2020, period=2)
+    text = ("第一节 重要提示\n公司注册地址报告期无变化，具体可参见2019年年报。\n"
+            + "正文。" * 50).encode()
+    result = inspect_markdown(entry.key, entry, text)
+    assert not result.year_verified
+    assert not any(f.rule in ("year_mismatch", "period_mismatch") for f in result.findings)
+
+
+def test_genuine_year_mismatch_survives_reference_filter():
+    """行首身份行（公司名+年份，无引用词）识别的错位仍然报告。"""
+    entry = _entry(year=2020, period=4)
+    text = _annual_body("大连橡胶塑料机械股份有限公司2010年半年度报告")
+    assert "year_mismatch" in _rules(text, entry)
+    assert "period_mismatch" in _rules(text, entry)
+
+
+def test_company_code_variant_and_referenced_codes_are_not_reported():
+    """封面"公司代码：600400"识别为本公司代码；释义表"曾用名…002243.SZ"不参与比对。"""
+    entry = _entry(year=2021, period=2, code="600400")
+    text = ("# 公司代码：600400 公司简称：红豆股份\n"
+            "# 2021年半年度报告\n"
+            "| 力合科创 | 指 | 深圳市力合科创股份有限公司（曾用名\"深圳市通产丽星股份有限公司\"，"
+            "股票代码：002243.SZ） |\n"
+            + "正文。" * 50).encode()
+    result = inspect_markdown(entry.key, entry, text)
+    assert not any(f.rule == "stock_code_mismatch" for f in result.findings)
+
+
+def test_controlling_shareholder_code_reference_is_not_reported():
+    """标题无代码、正文唯一代码来自控股股东释义时不应误报。"""
+    entry = _entry(year=2024, period=2, code="002167")
+    text = ("# 广东某科技股份有限公司\n"
+            "# 2024年半年度报告\n"
+            "| 龙佰集团 | 指 | 龙佰集团股份有限公司（股票代码：002601），"
+            "为广东某科技股份有限公司控股股东 |\n"
+            + "正文。" * 50).encode()
+    result = inspect_markdown(entry.key, entry, text)
+    assert not any(f.rule == "stock_code_mismatch" for f in result.findings)
+
+
+def test_foreign_exchange_suffix_code_is_not_reported():
+    """客户公司的境外交易所代码（.KS 后缀）不参与证券代码比对。"""
+    entry = _entry(year=2024, period=2, code="301567")
+    text = ("# 某精密科技股份有限公司\n"
+            "# 2024年半年度报告\n"
+            "三星电机株式会社（Samsung Electro-Mechanics，股票代码：009150.KS），系公司客户\n"
+            + "正文。" * 50).encode()
+    result = inspect_markdown(entry.key, entry, text)
+    assert not any(f.rule == "stock_code_mismatch" for f in result.findings)
+
+
+def test_genuine_wrong_cover_code_is_still_reported():
+    """封面"公司代码"变体识别出的真实错码仍然报告。"""
+    entry = _entry(year=2023, period=4, code="002167")
+    text = ("# 公司代码：002999 公司简称：错误主体\n"
+            "# 2023年年度报告\n"
+            + "正文。" * 50 + "\n备查文件目录\n审计报告\n财务报表\n").encode()
+    assert "stock_code_mismatch" in _rules(text, entry)
+
+
 def test_annual_missing_terminal_sections_is_suspect_not_hard_failure():
     text = ("# 2023年年度报告\n" + "正文。" * 100).encode()
     finding = _rules(text)["annual_terminal_missing"]
