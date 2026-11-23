@@ -1,0 +1,197 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-test:
+    name: Unit tests (offline)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Run unit tests
+        run: uv run pytest -q
+
+  infra-check:
+    name: Infra check (stunnel tunnel)
+    needs: unit-test
+    # Fork PRs must never receive secrets, so all pull_request events are skipped.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      NOOSHARE_INFRA: ${{ secrets.NOOSHARE_INFRA }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install tunnel tools and project dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y stunnel4 jq
+          uv sync --extra dev
+
+      # Secret-handling rationale (keep this comment with the parsing step):
+      # - NOOSHARE_INFRA is read only in-process by python3 via os.environ; the
+      #   shell never interpolates it. No trace mode, no printing of secret
+      #   values, and no JSON serialization of secrets into logs.
+      # - GitHub masks the raw JSON secret, but NOT derived values such as the
+      #   PSK hex or a DSN built from pg_password. Those are written exclusively
+      #   into 0600 files under $RUNNER_TEMP/corpus-ci.
+      # - The GitHub env-file mechanism is intentionally unused: it echoes values
+      #   into job logs and persists them for later steps. The runtime env file
+      #   is `source`d privately in the single step needing the credentials.
+      - name: Prepare tunnel config, PSK file and private runtime env file
+        run: |
+          python3 - <<'PY'
+          """Write tunnel material from NOOSHARE_INFRA; print no secret values."""
+          import json
+          import os
+          import shlex
+          from pathlib import Path
+          from urllib.parse import quote
+
+          work_dir = Path(os.environ["RUNNER_TEMP"]) / "corpus-ci"
+          work_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+          os.chmod(work_dir, 0o700)
+
+          infra = json.loads(os.environ["NOOSHARE_INFRA"])
+
+          def field(name: str) -> str:
+              """Return a required non-empty string field, or fail closed."""
+              value = infra.get(name)
+              if not isinstance(value, str) or not value.strip():
+                  raise SystemExit("NOOSHARE_INFRA: missing field " + name)
+              return value.strip()
+
+          stunnel_host = field("stunnel_host")
+          psk_hex = field("stunnel_psk")
+          pg_user = field("pg_user")
+          pg_password = field("pg_password")
+          pg_db = field("pg_db")
+          access_key = field("rustfs_access_key")
+          secret_key = field("rustfs_secret_key")
+          bucket = field("rustfs_bucket")
+
+          psk_file = work_dir / "k-ci.psk"
+          psk_file.write_text("k-ci:" + psk_hex + "\n", encoding="utf-8")
+          os.chmod(psk_file, 0o600)
+
+          pid_file = work_dir / "stunnel.pid"
+          conf_file = work_dir / "stunnel.conf"
+          conf_lines = [
+              "pid = " + str(pid_file),
+              "",
+              "[pg]",
+              "client = yes",
+              "accept = 127.0.0.1:15432",
+              "connect = " + stunnel_host + ":27002",
+              "sni = pg.noos.com",
+              "ciphers = PSK",
+              "PSKsecrets = " + str(psk_file),
+              "",
+              "[rustfs]",
+              "client = yes",
+              "accept = 127.0.0.1:15500",
+              "connect = " + stunnel_host + ":27002",
+              "sni = rustfs.noos.com",
+              "ciphers = PSK",
+              "PSKsecrets = " + str(psk_file),
+              "",
+          ]
+          conf_file.write_text("\n".join(conf_lines), encoding="utf-8")
+          os.chmod(conf_file, 0o600)
+
+          # URL-encode credentials so '@' or '/' in a password cannot break the DSN.
+          dsn = (
+              "postgresql://"
+              + quote(pg_user, safe="")
+              + ":"
+              + quote(pg_password, safe="")
+              + "@127.0.0.1:15432/"
+              + quote(pg_db, safe="")
+          )
+          env_file = work_dir / "runtime.env"
+          env_file.write_text(
+              "\n".join([
+                  "DATABASE_URL=" + shlex.quote(dsn),
+                  "RUSTFS_ENDPOINT_URL=" + shlex.quote("http://127.0.0.1:15500"),
+                  "RUSTFS_ACCESS_KEY=" + shlex.quote(access_key),
+                  "RUSTFS_SECRET_KEY=" + shlex.quote(secret_key),
+                  "CORPUS_RUSTFS_BUCKET=" + shlex.quote(bucket),
+                  "",
+              ]),
+              encoding="utf-8",
+          )
+          os.chmod(env_file, 0o600)
+          PY
+
+      - name: Start stunnel
+        run: |
+          work_dir="$RUNNER_TEMP/corpus-ci"
+          stunnel_bin="$(command -v stunnel || command -v stunnel4)"
+          "$stunnel_bin" "$work_dir/stunnel.conf"
+          for _ in $(seq 1 30); do
+            if [ -s "$work_dir/stunnel.pid" ]; then
+              break
+            fi
+            sleep 1
+          done
+          test -s "$work_dir/stunnel.pid"
+
+      - name: Wait for tunnel listeners
+        run: |
+          for port in 15432 15500; do
+            ready=0
+            for _ in $(seq 1 30); do
+              if timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" 2>/dev/null; then
+                ready=1
+                break
+              fi
+              sleep 1
+            done
+            if [ "$ready" -ne 1 ]; then
+              echo "Tunnel port $port not ready after 30s" >&2
+              exit 1
+            fi
+          done
+
+      - name: Run corpus check through tunnel
+        run: |
+          set -a
+          # shellcheck disable=SC1090
+          source "$RUNNER_TEMP/corpus-ci/runtime.env"
+          set +a
+          uv run nooshare-annual-semi-corpus check --limit 5
+
+      - name: Stop stunnel and remove secret material
+        if: always()
+        run: |
+          work_dir="$RUNNER_TEMP/corpus-ci"
+          pid_file="$work_dir/stunnel.pid"
+          if [ -s "$pid_file" ]; then
+            pid="$(cat "$pid_file")"
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+              kill "$pid" 2>/dev/null || true
+            fi
+          fi
+          rm -f "$pid_file" "$work_dir/stunnel.conf" "$work_dir/k-ci.psk" "$work_dir/runtime.env"

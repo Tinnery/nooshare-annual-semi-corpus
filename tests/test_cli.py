@@ -1,36 +1,27 @@
-"""Basic CLI tests for nooshare-annual-semi-corpus."""
+"""CLI structure tests: only the check command is exposed."""
 
 from typer.testing import CliRunner
+
 from annual_semi_corpus.cli import app
 
 runner = CliRunner()
 
 
-def test_cli_help():
-    """Test that CLI shows help message."""
+def test_cli_help_shows_check():
+    """CLI help lists check."""
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    assert "inventory" in result.stdout
-    assert "assess" in result.stdout
-    assert "diff" in result.stdout
+    assert "check" in result.stdout
 
 
-def test_inventory_command():
-    """Test inventory command exists."""
-    result = runner.invoke(app, ["inventory"])
+def test_only_check_command_registered():
+    """No legacy commands remain registered."""
+    names = sorted(cmd.callback.__name__ for cmd in app.registered_commands)
+    assert names == ["check"]
+
+
+def test_check_help_exposes_env_file_option():
+    """check accepts --env-file so config can come from a local .env."""
+    result = runner.invoke(app, ["check", "--help"])
     assert result.exit_code == 0
-    assert "not yet implemented" in result.stdout
-
-
-def test_assess_command():
-    """Test assess command exists."""
-    result = runner.invoke(app, ["assess"])
-    assert result.exit_code == 0
-    assert "not yet implemented" in result.stdout
-
-
-def test_diff_command():
-    """Test diff command exists."""
-    result = runner.invoke(app, ["diff"])
-    assert result.exit_code == 0
-    assert "not yet implemented" in result.stdout
+    assert "--env-file" in result.stdout

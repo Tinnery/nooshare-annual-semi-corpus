@@ -1,10 +1,9 @@
-"""check 命令纯函数单测：不访问 PG / RustFS，不依赖网络。"""
+"""check 纯计算单测：不访问 PG / RustFS，不依赖网络。"""
 
-from annual_semi_corpus.cli import (
+from annual_semi_corpus.core import (
     build_md_key,
     compare_keys,
     period_to_slot,
-    project_actual_keys,
 )
 
 
@@ -37,18 +36,3 @@ def test_compare_keys():
     assert result.actual_count == 3
     assert result.missing == ("a",)
     assert result.orphans == ("d",)
-
-
-def test_project_actual_keys_by_code():
-    """public 模式：多个 md 折叠为同一 code 前缀。"""
-    keys = {
-        "published/000001/000001_2018_4.md",
-        "published/000001/000001_2019_2.md",
-        "published/000002/000002_2018_2.md",
-        "other/000003.md",
-    }
-    assert project_actual_keys(keys, "published/", True) == {
-        "published/000001/",
-        "published/000002/",
-    }
-    assert project_actual_keys(keys, "published/", False) == keys
