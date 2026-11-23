@@ -100,8 +100,11 @@ jobs:
 
           pid_file = work_dir / "stunnel.pid"
           conf_file = work_dir / "stunnel.conf"
+          log_file = work_dir / "stunnel.log"
           conf_lines = [
               "pid = " + str(pid_file),
+              "debug = 7",
+              "output = " + str(log_file),
               "",
               "[pg]",
               "client = yes",
@@ -185,6 +188,18 @@ jobs:
           set +a
           uv run nooshare-annual-semi-corpus check --limit 5
 
+      - name: Dump stunnel diagnostics on failure
+        if: failure()
+        run: |
+          # stunnel debug logs contain no PSK hex (only the identity name and
+          # handshake/SNI outcomes), but filter defensively anyway.
+          log="$RUNNER_TEMP/corpus-ci/stunnel.log"
+          if [ -f "$log" ]; then
+            grep -iE "sni|handshake|psk|error|fail|close|reject" "$log" \
+              | grep -viE "[0-9a-f]{32,}|k-ci:" \
+              | tail -40 || true
+          fi
+
       - name: Stop stunnel and remove secret material
         if: always()
         run: |
@@ -196,4 +211,4 @@ jobs:
               kill "$pid" 2>/dev/null || true
             fi
           fi
-          rm -f "$pid_file" "$work_dir/stunnel.conf" "$work_dir/k-ci.psk" "$work_dir/runtime.env"
+          rm -f "$pid_file" "$work_dir/stunnel.conf" "$work_dir/k-ci.psk" "$work_dir/runtime.env" "$work_dir/stunnel.log"
