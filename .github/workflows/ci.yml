@@ -200,7 +200,7 @@ jobs:
           # of the log; capture full output privately and echo only counts.
           out="$RUNNER_TEMP/corpus-ci/check.out"
           status=0
-          uv run nooshare-annual-semi-corpus check --limit 5 > "$out" 2>&1 || status=$?
+          uv run nooshare-annual-semi-corpus check --year-min 2020 > "$out" 2>&1 || status=$?
           # Echo only aggregate counts / error lines; corpus gap keys stay private.
           grep -E "check 摘要|schema |期望对象数|实有对象数|缺失数|孤儿数|错误" "$out" || true
           exit "$status"

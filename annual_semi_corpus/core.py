@@ -69,13 +69,21 @@ def build_md_key(code: str, year: int, period: int, prefix: str = "published/") 
     return f"{base}{code}/{code}_{year}_{period}.md"
 
 
-def compare_keys(expected: set[str], actual: set[str]) -> CheckResult:
-    """集合比对：期望−实有=缺失，实有−期望=孤儿。纯函数，不访问外部系统。"""
+def compare_keys(
+    expected: set[str], actual: set[str], *, report_orphans: bool = True
+) -> CheckResult:
+    """集合比对；按发布日期筛选时，无法从对象 Key 推导孤儿的 pub_date。
+
+    When ``report_orphans`` is false, ``actual_count`` is the number of
+    expected keys found in the full object listing, and orphan classification
+    is intentionally omitted because object keys do not contain pub_date.
+    """
     missing = tuple(sorted(expected - actual))
-    orphans = tuple(sorted(actual - expected))
+    matched = expected & actual
+    orphans = tuple(sorted(actual - expected)) if report_orphans else ()
     return CheckResult(
         expected_count=len(expected),
-        actual_count=len(actual),
+        actual_count=len(actual) if report_orphans else len(matched),
         missing=missing,
         orphans=orphans,
     )

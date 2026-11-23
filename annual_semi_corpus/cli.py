@@ -94,16 +94,25 @@ def check(
         typer.echo(f"错误：读取 RustFS 清单失败：{exc}", err=True)
         raise typer.Exit(code=1) from exc
 
-    result = compare_keys(set(expected), full_keys)
+    has_pub_date_filter = year_min is not None or year_max is not None
+    result = compare_keys(
+        set(expected), full_keys, report_orphans=not has_pub_date_filter
+    )
 
     typer.echo("check 摘要")
     typer.echo("  schema     : ju")
     typer.echo(f"  bucket     : {settings.bucket}")
     typer.echo(f"  prefix     : {settings.prefix}")
     typer.echo(f"  期望对象数 : {result.expected_count}")
-    typer.echo(f"  实有对象数 : {result.actual_count}")
+    if has_pub_date_filter:
+        typer.echo(f"  实有对象数（期望命中）: {result.actual_count}")
+    else:
+        typer.echo(f"  实有对象数 : {result.actual_count}")
     typer.echo(f"  缺失数     : {len(result.missing)}")
-    typer.echo(f"  孤儿数     : {len(result.orphans)}")
+    if has_pub_date_filter:
+        typer.echo("  孤儿数     : 不适用（对象 Key 不包含 pub_date，无法按发布日期范围归属）")
+    else:
+        typer.echo(f"  孤儿数     : {len(result.orphans)}")
 
     if result.missing:
         typer.echo("缺失样本（前 20）：")

@@ -36,3 +36,20 @@ def test_compare_keys():
     assert result.actual_count == 3
     assert result.missing == ("a",)
     assert result.orphans == ("d",)
+
+
+def test_compare_keys_without_pub_date_orphan_scope():
+    """发布日期范围只统计期望 Key 命中；不把其他年份对象误报为孤儿。"""
+    result = compare_keys(
+        {"published/000001/000001_2019_4.md", "published/000001/000001_2020_4.md"},
+        {
+            "published/000001/000001_2019_4.md",
+            "published/000001/000001_2020_4.md",
+            "published/000002/000002_2008_4.md",
+        },
+        report_orphans=False,
+    )
+    assert result.expected_count == 2
+    assert result.actual_count == 2
+    assert result.missing == ()
+    assert result.orphans == ()
