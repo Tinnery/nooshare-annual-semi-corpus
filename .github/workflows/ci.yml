@@ -163,19 +163,22 @@ jobs:
           done
           test -s "$work_dir/stunnel.pid"
 
+      # Do NOT probe with /dev/tcp here: each probe opens a real TLS session
+      # through the CI SNI router, consuming a scarce remote connection slot.
+      # Checking stunnel's own local listeners is enough (no remote handshake).
       - name: Wait for tunnel listeners
         run: |
           for port in 15432 15500; do
             ready=0
             for _ in $(seq 1 30); do
-              if timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" 2>/dev/null; then
+              if ss -ltn 2>/dev/null | grep -q "127.0.0.1:$port"; then
                 ready=1
                 break
               fi
               sleep 1
             done
             if [ "$ready" -ne 1 ]; then
-              echo "Tunnel port $port not ready after 30s" >&2
+              echo "stunnel listener $port not ready after 30s" >&2
               exit 1
             fi
           done
