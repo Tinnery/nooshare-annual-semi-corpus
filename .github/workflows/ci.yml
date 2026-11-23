@@ -202,7 +202,7 @@ jobs:
           status=0
           uv run nooshare-annual-semi-corpus check --year-min 2020 > "$out" 2>&1 || status=$?
           # Echo only aggregate counts / error lines; corpus gap keys stay private.
-          grep -E "check 摘要|schema |期望对象数|实有对象数|缺失数|孤儿数|内容检查|命中对象数|正文抽样数|样本分组数|已尝试读取|样本可读取|样本无问题|样本未识别年度|内容问题|invalid_utf8|empty|too_short|stub_content|error_page|truncated|year_mismatch|period_mismatch|stock_code_mismatch|annual_terminal|read_error|错误" "$out" || true
+          grep -E "check 摘要|schema |期望对象数|实有对象数|缺失数|孤儿数|内容检查|命中对象数|正文抽样数|样本分组数|已尝试读取|样本可读取|样本无问题|样本未识别年度|内容问题|invalid_utf8|empty|too_short|stub_content|error_page|truncated|year_mismatch|period_mismatch|stock_code_mismatch|annual_terminal|annual_tail_drift|read_error|错误" "$out" || true
           exit "$status"
 
       - name: Stop stunnel and remove secret material
