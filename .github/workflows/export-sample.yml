@@ -1,0 +1,267 @@
+name: Export Sample
+
+on:
+  workflow_dispatch:
+    inputs:
+      slot_key:
+        description: 'Report slot key (e.g. 002416_2025_4)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    name: Export single Markdown sample
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # NOOSHARE_INFRA is intentionally NOT set at job level: only the single
+    # Prepare step receives it, so checkout / setup-uv / install steps never
+    # inherit the raw infrastructure secret.
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install tunnel tools and project dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y stunnel4 jq
+          uv sync
+
+      # Secret-handling rationale (keep this comment with the parsing step):
+      # - NOOSHARE_INFRA is read only in-process by python3 via os.environ; the
+      #   shell never interpolates it. No trace mode, no printing of secret
+      #   values, and no JSON serialization of secrets into logs.
+      # - GitHub masks the raw JSON secret, but NOT derived values such as the
+      #   PSK hex. Those are written exclusively into 0600 files under
+      #   $RUNNER_TEMP/corpus-export.
+      # - This workflow does NOT read PostgreSQL credentials. Only RustFS
+      #   access is required for single-file export.
+      - name: Prepare RustFS tunnel config and PSK file
+        env:
+          NOOSHARE_INFRA: ${{ secrets.NOOSHARE_INFRA }}
+        run: |
+          python3 - <<'PY'
+          """Write RustFS-only tunnel material from NOOSHARE_INFRA."""
+          import json
+          import os
+          from pathlib import Path
+
+          work_dir = Path(os.environ["RUNNER_TEMP"]) / "corpus-export"
+          work_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+          os.chmod(work_dir, 0o700)
+
+          infra = json.loads(os.environ["NOOSHARE_INFRA"])
+
+          def field(name: str) -> str:
+              value = infra.get(name)
+              if not isinstance(value, str) or not value.strip():
+                  raise SystemExit("NOOSHARE_INFRA: missing field " + name)
+              return value.strip()
+
+          stunnel_host = field("stunnel_host")
+          psk_hex = field("stunnel_psk")
+          access_key = field("rustfs_access_key")
+          secret_key = field("rustfs_secret_key")
+          bucket = field("rustfs_bucket")
+
+          psk_file = work_dir / "k-export.psk"
+          # stunnel_psk is already the complete "identity:hex" form.
+          psk_file.write_text(psk_hex + "\n", encoding="utf-8")
+          os.chmod(psk_file, 0o600)
+
+          pid_file = work_dir / "stunnel.pid"
+          conf_file = work_dir / "stunnel.conf"
+          conf_lines = [
+              "pid = " + str(pid_file),
+              "",
+              "[rustfs]",
+              "client = yes",
+              "accept = 127.0.0.1:15500",
+              "connect = " + stunnel_host + ":27002",
+              "sni = rustfs.noos.com",
+              "ciphers = PSK",
+              "PSKsecrets = " + str(psk_file),
+              "",
+          ]
+          conf_file.write_text("\n".join(conf_lines), encoding="utf-8")
+          os.chmod(conf_file, 0o600)
+
+          # Write runtime env for the export step only.
+          import shlex
+          env_file = work_dir / "runtime.env"
+          env_file.write_text(
+              "\n".join([
+                  "RUSTFS_ENDPOINT_URL=" + shlex.quote("http://127.0.0.1:15500"),
+                  "RUSTFS_ACCESS_KEY=" + shlex.quote(access_key),
+                  "RUSTFS_SECRET_KEY=" + shlex.quote(secret_key),
+                  "CORPUS_RUSTFS_BUCKET=" + shlex.quote(bucket),
+                  "",
+              ]),
+              encoding="utf-8",
+          )
+          os.chmod(env_file, 0o600)
+          PY
+
+      - name: Start stunnel
+        run: |
+          work_dir="$RUNNER_TEMP/corpus-export"
+          stunnel_bin="$(command -v stunnel || command -v stunnel4)"
+          "$stunnel_bin" "$work_dir/stunnel.conf"
+          for _ in $(seq 1 30); do
+            if [ -s "$work_dir/stunnel.pid" ]; then
+              break
+            fi
+            sleep 1
+          done
+          test -s "$work_dir/stunnel.pid"
+
+      - name: Wait for tunnel listener
+        run: |
+          ready=0
+          for _ in $(seq 1 30); do
+            if ss -ltn 2>/dev/null | grep -q "127.0.0.1:15500"; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "stunnel listener 15500 not ready after 30s" >&2
+            exit 1
+          fi
+
+      - name: Validate slot_key and export Markdown
+        env:
+          SLOT_KEY: ${{ inputs.slot_key }}
+        run: |
+          set -a
+          # shellcheck disable=SC1090
+          source "$RUNNER_TEMP/corpus-export/runtime.env"
+          set +a
+
+          python3 - <<'PY'
+          """Validate slot_key, fetch object, write artifact material."""
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          import boto3
+          from botocore.exceptions import ClientError
+
+          SLOT_KEY = os.environ["SLOT_KEY"]
+          # Strict format: 6-digit code + _ + 4-digit year + _ + 1-digit period (2 or 4)
+          SLOT_RE = re.compile(r"^(\d{6})_(\d{4})_([24])$")
+          match = SLOT_RE.match(SLOT_KEY)
+          if not match:
+              print(f"ERROR: slot_key '{SLOT_KEY}' does not match format CCCCCC_YYYY_P", file=sys.stderr)
+              sys.exit(1)
+
+          code, year_str, period_str = match.groups()
+          year = int(year_str)
+          period = int(period_str)
+
+          if not (1990 <= year <= 2100):
+              print(f"ERROR: year {year} out of range [1990, 2100]", file=sys.stderr)
+              sys.exit(1)
+
+          # Reuse the canonical key builder from corpus core.
+          sys.path.insert(0, str(Path.cwd()))
+          from annual_semi_corpus.core import build_md_key
+
+          object_key = build_md_key(code, year, period)
+          bucket = os.environ["CORPUS_RUSTFS_BUCKET"]
+          endpoint = os.environ["RUSTFS_ENDPOINT_URL"]
+          access_key = os.environ["RUSTFS_ACCESS_KEY"]
+          secret_key = os.environ["RUSTFS_SECRET_KEY"]
+
+          print(f"slot_key: {SLOT_KEY}")
+          print(f"object_key: {object_key}")
+
+          s3 = boto3.client(
+              "s3",
+              endpoint_url=endpoint,
+              aws_access_key_id=access_key,
+              aws_secret_access_key=secret_key,
+          )
+
+          # Head first to confirm existence and get size.
+          try:
+              head = s3.head_object(Bucket=bucket, Key=object_key)
+          except ClientError as e:
+              code_err = e.response["Error"]["Code"]
+              print(f"ERROR: {code_err} for {object_key}", file=sys.stderr)
+              sys.exit(1)
+
+          content_length = head["ContentLength"]
+          print(f"content_length: {content_length}")
+
+          # Fetch full object.
+          obj = s3.get_object(Bucket=bucket, Key=object_key)
+          data = obj["Body"].read()
+
+          if len(data) != content_length:
+              print(f"ERROR: size mismatch head={content_length} get={len(data)}", file=sys.stderr)
+              sys.exit(1)
+
+          # Validate UTF-8.
+          try:
+              text = data.decode("utf-8", errors="strict")
+              utf8_valid = True
+          except UnicodeDecodeError:
+              utf8_valid = False
+              text = ""
+
+          sha256 = hashlib.sha256(data).hexdigest()
+
+          # Write artifact material to a temp directory.
+          export_dir = Path(os.environ["RUNNER_TEMP"]) / "export"
+          export_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+
+          md_path = export_dir / f"{SLOT_KEY}.md"
+          md_path.write_bytes(data)
+
+          manifest = {
+              "slot_key": SLOT_KEY,
+              "object_key": object_key,
+              "bucket": bucket,
+              "content_length": content_length,
+              "sha256": sha256,
+              "utf8_valid": utf8_valid,
+          }
+          manifest_path = export_dir / "manifest.json"
+          manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+
+          print(f"sha256: {sha256}")
+          print(f"utf8_valid: {utf8_valid}")
+          print(f"artifact_uploaded: false")  # Updated by upload step.
+          PY
+
+      - name: Upload selected Markdown
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustfs-md-${{ inputs.slot_key }}
+          path: ${{ runner.temp }}/export/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Stop stunnel and remove secret material
+        if: always()
+        run: |
+          work_dir="$RUNNER_TEMP/corpus-export"
+          pid_file="$work_dir/stunnel.pid"
+          if [ -s "$pid_file" ]; then
+            pid="$(cat "$pid_file")"
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+              kill "$pid" 2>/dev/null || true
+            fi
+          fi
+          rm -f "$pid_file" "$work_dir/stunnel.conf" "$work_dir/k-export.psk" "$work_dir/runtime.env"
+          rm -rf "$RUNNER_TEMP/export"
