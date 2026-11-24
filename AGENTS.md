@@ -2,6 +2,26 @@
 
 本仓库负责 A 股年报/半年报 Markdown 语料的独立登记与质量管理。
 
+## 公共仓库文档禁令（硬约束）
+
+本仓库是 public repo，以下规则优先于任何“按需写文档”的冲动：
+
+1. **禁止文档目录**：不得新建或保留 `docs/`、`doc/`、`documentation/`、`deliverables/`、`reports/`、`notes/`、`specs/`、`decisions/`、`history/` 等文档或过程目录。
+2. **禁止生成文字材料**：说明、使用指南、API 文档、数据字典、需求、设计、报告、评审记录、笔记等文字文件（`.md` / `.rst` / `.pdf` / `.docx` 等）不得在本仓库生成或提交。机器运行产生的临时输出只能写入被忽略的 `.runtime/`，且不得作为文档维护。
+3. **README.md 只做入口**：仅保留标题与一句话定位。`AGENTS.md` 只放规则与路由，不堆砌知识正文。
+4. **文字材料唯一归属**：所有文字材料必须维护在私有仓库 `nooshare-design` 的 `implementation-docs/<本仓库名>/` 下；本仓库只引用，不复制。
+5. **违规处理**：发现本仓库出现上述目录或文字材料，不就地修订——先迁移到 nooshare-design，再删除本地文件，并更新下方索引表。
+
+### 文字材料索引（nooshare-design）
+
+| 材料 | 权威位置 |
+|------|----------|
+| 文档体系总索引 | `doc-index/index.md` |
+| 本仓库文档归属与维护边界 | `doc-index/nooshare-annual-semi-corpus.md` |
+| 公共仓库文字材料总索引 | `implementation-docs/index.md` |
+
+通过 `workspace.yaml` 定位 nooshare-design 的 checkout 路径后读取上述文件。
+
 ## Matrix Authority
 
 - **nooshare-design**：系统角色与跨仓逻辑职责（architecture/matrix.md）。
@@ -35,7 +55,6 @@
   - `cli.py`：trigger 层（参数解析、输出格式化）
   - `tasks/`：应用编排层（协调 adapters 和 core，实现业务用例）
 - CLI 命令（`check`，唯一命令）
-- check 报告（运行时生成，不纳入版本控制）
 - 本地运行时配置（`.env`，含 PG / RustFS 凭据，被 `.gitignore` 排除，禁止提交）
 - 测试（`tests/`）
 
@@ -75,14 +94,14 @@ uv run pytest
 - 涉及 DEV / VALIDATION / STABLE 的测试需明确环境标识
 - 生产数据不允许用于测试
 
-## 文档与结构权威
+## 结构纪律
 
 本仓库不内联结构纪律正文，也不维护第二份文档注册表。按权威引用：
 
 | 关注点 | 权威 | 读什么 |
 |--------|------|--------|
-| 结构纪律（Git 唯一记录、平铺、按需建目录、AGENTS.md 职责） | nooshare-workenv | `AGENTS.md` |
-| 文档体系归属与维护边界 | nooshare-design | `nooshare-design/doc-index/nooshare-annual-semi-corpus.md` |
+| 结构纪律（Git 唯一记录、平铺、按需建目录、AGENTS.md 职责、公共仓库文档禁令） | nooshare-workenv | `AGENTS.md` |
+| 文档体系归属与维护边界 | nooshare-design | `doc-index/index.md` |
 | 期望清单（code 与 pub dates） | nooshare-annual-semi（数据生产者） | `ju.pub_date`（经 `workspace.yaml` 定位其契约） |
 | md 库对象与惰性加载（RustFS published/） | nooshare-annual-semi | `annual_semi/objectstore/rustfs.py`（published key 规律） |
 
