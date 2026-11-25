@@ -1,0 +1,558 @@
+name: Research Artifact Audit (read-only)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/research-artifact-audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: research-artifact-audit-002452
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    name: Audit 002452 research output (read-only)
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+
+      - name: Install stunnel and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends stunnel4
+          uv sync --extra dev
+
+      # This uses exactly the existing Corpus CI secret and k-ci SNI route.
+      # NOOSHARE_INFRA is available to this step only.
+      - name: Prepare the existing CI tunnel and private runtime env
+        env:
+          NOOSHARE_INFRA: ${{ secrets.NOOSHARE_INFRA }}
+        run: |
+          python3 - <<'PY'
+          import json, os, shlex
+          from pathlib import Path
+          from urllib.parse import quote
+
+          raw=os.environ.get("NOOSHARE_INFRA","")
+          if not raw:
+              raise SystemExit("NOOSHARE_INFRA is not configured")
+          infra=json.loads(raw)
+          def required(key):
+              v=infra.get(key)
+              if not isinstance(v,str) or not v.strip():
+                  raise SystemExit("NOOSHARE_INFRA is missing a required field")
+              return v.strip()
+
+          work=Path(os.environ["RUNNER_TEMP"])/"research-audit"
+          work.mkdir(mode=0o700,parents=True,exist_ok=True)
+          os.chmod(work,0o700)
+          host=required("stunnel_host")
+          psk=required("stunnel_psk")
+          pg_user=required("pg_user")
+          pg_password=required("pg_password")
+          pg_db=required("pg_db")
+          access=required("rustfs_access_key")
+          secret=required("rustfs_secret_key")
+          bucket=required("rustfs_bucket")
+
+          psk_file=work/"k-ci.psk"
+          psk_file.write_text(psk+"\n",encoding="utf-8")
+          os.chmod(psk_file,0o600)
+          pid_file=work/"stunnel.pid"
+          conf_file=work/"stunnel.conf"
+          lines=[
+            "pid = "+str(pid_file),"",
+            "[pg]","client = yes","accept = 127.0.0.1:15432",
+            "connect = "+host+":27002","sni = pg.noos.com","ciphers = PSK",
+            "PSKsecrets = "+str(psk_file),"",
+            "[rustfs]","client = yes","accept = 127.0.0.1:15500",
+            "connect = "+host+":27002","sni = rustfs.noos.com","ciphers = PSK",
+            "PSKsecrets = "+str(psk_file),"",
+          ]
+          conf_file.write_text("\n".join(lines),encoding="utf-8")
+          os.chmod(conf_file,0o600)
+
+          dsn=("postgresql://"+quote(pg_user,safe="")+":"+
+               quote(pg_password,safe="")+"@127.0.0.1:15432/"+
+               quote(pg_db,safe=""))
+          env_file=work/"runtime.env"
+          env_file.write_text("\n".join([
+            "DATABASE_URL="+shlex.quote(dsn),
+            "RUSTFS_ENDPOINT_URL="+shlex.quote("http://127.0.0.1:15500"),
+            "RUSTFS_ACCESS_KEY="+shlex.quote(access),
+            "RUSTFS_SECRET_KEY="+shlex.quote(secret),
+            "CORPUS_RUSTFS_BUCKET="+shlex.quote(bucket),
+            "",
+          ]),encoding="utf-8")
+          os.chmod(env_file,0o600)
+          PY
+
+      - name: Start stunnel
+        run: |
+          work="$RUNNER_TEMP/research-audit"
+          stunnel_bin="$(command -v stunnel || command -v stunnel4)"
+          "$stunnel_bin" "$work/stunnel.conf"
+          for _ in $(seq 1 30); do
+            [ -s "$work/stunnel.pid" ] && break
+            sleep 1
+          done
+          test -s "$work/stunnel.pid"
+
+      - name: Wait for existing PG and RustFS listeners
+        run: |
+          for port in 15432 15500; do
+            ready=0
+            for _ in $(seq 1 30); do
+              if ss -ltn 2>/dev/null | grep -q "127.0.0.1:$port"; then
+                ready=1
+                break
+              fi
+              sleep 1
+            done
+            [ "$ready" -eq 1 ] || exit 1
+          done
+
+      - name: Run read-only Research output audit
+        run: |
+          set -a
+          # shellcheck disable=SC1090
+          source "$RUNNER_TEMP/research-audit/runtime.env"
+          set +a
+          uv run python - <<'PY'
+          from __future__ import annotations
+          
+          import hashlib
+          import json
+          import os
+          import sys
+          from collections import Counter
+          from typing import Any
+          
+          import boto3
+          import botocore.config
+          import psycopg
+          
+          SLOT = "002452_2025_4"
+          STOCK = "002452"
+          EXPECTED_BYTES = 458990
+          SOURCE_KEY = "published/002452/002452_2025_4.md"
+          DEV_BUCKET = "nooshare-dev"
+          LEGACY_REPORTED_BUCKET = "annual-semi"
+          RESULT_PREFIX = "research/002452_2025_4/"
+          
+          def table_exists(cur: Any, name: str) -> bool:
+              cur.execute("SELECT to_regclass(%s)", (f"research.{name}",))
+              row = cur.fetchone()
+              return bool(row and row[0])
+          
+          def table_columns(cur: Any, name: str) -> set[str]:
+              cur.execute(
+                  """
+                  SELECT column_name FROM information_schema.columns
+                  WHERE table_schema='research' AND table_name=%s
+                  """,
+                  (name,),
+              )
+              return {str(row[0]) for row in cur.fetchall()}
+          
+          def rows_by_ids(cur: Any, table: str, column: str, ids: list[str]) -> list[dict[str,Any]]:
+              if not ids or column not in table_columns(cur,table):
+                  return []
+              cur.execute(
+                  f'SELECT * FROM research."{table}" WHERE "{column}"::text = ANY(%s)',
+                  (ids,),
+              )
+              names=[d.name for d in cur.description]
+              return [dict(zip(names,row)) for row in cur.fetchall()]
+          
+          def fk_count(cur: Any, table: str) -> int:
+              cur.execute(
+                  """
+                  SELECT count(*) FROM information_schema.table_constraints
+                  WHERE constraint_schema='research' AND table_name=%s
+                    AND constraint_type='FOREIGN KEY'
+                  """,
+                  (table,),
+              )
+              return int(cur.fetchone()[0])
+          
+          def span_coverage(spans: list[tuple[int,int]], total: int) -> dict[str,Any]:
+              valid=sorted((a,b) for a,b in spans if 0 <= a < b <= total)
+              merged: list[list[int]]=[]
+              overlaps=0
+              for a,b in valid:
+                  if not merged or a > merged[-1][1]:
+                      merged.append([a,b])
+                  else:
+                      if a < merged[-1][1]:
+                          overlaps += 1
+                      merged[-1][1]=max(merged[-1][1],b)
+              covered=sum(b-a for a,b in merged)
+              return {
+                  "valid_spans":len(valid),
+                  "invalid_spans":len(spans)-len(valid),
+                  "overlaps":overlaps,
+                  "covered_bytes":covered,
+                  "uncovered_bytes":max(0,total-covered),
+                  "coverage_pct":round(covered*100/total,4) if total else 0,
+              }
+          
+          def hashes_in(value: Any) -> list[str]:
+              found: list[str]=[]
+              if isinstance(value,dict):
+                  for key,child in value.items():
+                      if str(key).lower() in {
+                          "source_sha256","source_hash","markdown_sha256",
+                          "source_content_sha256","input_sha256",
+                      } and isinstance(child,str):
+                          found.append(child.lower())
+                      found.extend(hashes_in(child))
+              elif isinstance(value,list):
+                  for child in value:
+                      found.extend(hashes_in(child))
+              return found
+          
+          def main() -> None:
+              report: dict[str,Any]={"slot":SLOT}
+              try:
+                  # Use the same S3 endpoint and CI credentials as the existing Corpus check.
+                  s3=boto3.client(
+                      "s3",
+                      endpoint_url=os.environ["RUSTFS_ENDPOINT_URL"],
+                      aws_access_key_id=os.environ["RUSTFS_ACCESS_KEY"],
+                      aws_secret_access_key=os.environ["RUSTFS_SECRET_KEY"],
+                      region_name="us-east-1",
+                      config=botocore.config.Config(
+                          proxies={"http":None,"https":None},
+                          connect_timeout=10,
+                          read_timeout=60,
+                          retries={"max_attempts":2,"mode":"standard"},
+                      ),
+                  )
+                  source_bucket=os.environ["CORPUS_RUSTFS_BUCKET"]
+                  head=s3.head_object(Bucket=source_bucket,Key=SOURCE_KEY)
+                  response=s3.get_object(Bucket=source_bucket,Key=SOURCE_KEY)
+                  try:
+                      source_bytes=response["Body"].read()
+                  finally:
+                      response["Body"].close()
+                  source_bytes.decode("utf-8",errors="strict")
+                  source_hash=hashlib.sha256(source_bytes).hexdigest()
+                  report["source"]={
+                      "bytes":len(source_bytes),
+                      "reported_size_matches":len(source_bytes)==int(head["ContentLength"])==EXPECTED_BYTES,
+                      "sha256_prefix":source_hash[:16],
+                      "source_bucket_matches_research_reader":source_bucket=="annual-semi",
+                  }
+          
+                  # Inspect the exact DEV database only, with the PostgreSQL transaction forced read-only.
+                  with psycopg.connect(
+                      os.environ["DATABASE_URL"],
+                      connect_timeout=10,
+                      application_name="corpus-readonly-research-audit",
+                  ) as conn:
+                      conn.read_only=True
+                      with conn.cursor() as cur:
+                          cur.execute(
+                              "SELECT current_database(),current_user,current_setting('transaction_read_only')"
+                          )
+                          db_name,db_user,read_only=cur.fetchone()
+                          report["postgresql"]={
+                              "database_is_dev":db_name=="nooshare_dev",
+                              "transaction_read_only":read_only=="on",
+                              "connected_as_ci_role":db_user=="ci",
+                          }
+                          if db_name!="nooshare_dev" or read_only!="on":
+                              raise RuntimeError("POSTGRESQL_ENVIRONMENT_GUARD")
+          
+                          cur.execute("SELECT * FROM research.document WHERE slot_key=%s",(SLOT,))
+                          doc_names=[d.name for d in cur.description]
+                          docs=[dict(zip(doc_names,row)) for row in cur.fetchall()]
+                          report["document_rows"]=len(docs)
+                          if len(docs)!=1:
+                              raise RuntimeError("DOCUMENT_SLOT_NOT_UNIQUE")
+                          document_id=str(docs[0]["document_id"])
+          
+                          cur.execute(
+                              "SELECT * FROM research.document_version WHERE document_id=%s",
+                              (document_id,),
+                          )
+                          version_names=[d.name for d in cur.description]
+                          versions=[dict(zip(version_names,row)) for row in cur.fetchall()]
+                          version=next(
+                              (v for v in versions
+                               if str(v.get("source_sha256","")).lower()==source_hash.lower()),
+                              None,
+                          )
+                          if version is None:
+                              raise RuntimeError("DOCUMENT_VERSION_SOURCE_HASH_NOT_FOUND")
+                          version_id=str(version["document_version_id"])
+                          report["target_document_version"]={
+                              "version_count":len(versions),
+                              "source_hash_matches":True,
+                              "byte_count_matches":int(version["n_bytes"])==len(source_bytes),
+                              "source_uri_matches_expected_key":version.get("source_uri")=="rustfs://"+SOURCE_KEY,
+                              "placeholder_uri": "placeholder" in str(version.get("source_uri","")).lower(),
+                          }
+          
+                          # Inspect the repaired population of H1-backed Research versions.
+                          cur.execute(
+                              """
+                              SELECT d.document_id,d.slot_key,d.stock_code,
+                                     dv.document_version_id,dv.source_uri,dv.n_bytes
+                              FROM research.document d
+                              JOIN research.document_version dv USING(document_id)
+                              WHERE d.h1_heading_count IS NOT NULL
+                              """
+                          )
+                          hcols=[d.name for d in cur.description]
+                          h1=[dict(zip(hcols,row)) for row in cur.fetchall()]
+                          h1_ids=sorted({str(r["document_version_id"]) for r in h1})
+                          uri_matches=0
+                          placeholders=0
+                          h1_objects=[]
+                          for row in h1:
+                              key=f"published/{str(row['stock_code']).zfill(6)}/{row['slot_key']}.md"
+                              if row.get("source_uri")=="rustfs://"+key:
+                                  uri_matches += 1
+                              if "placeholder" in str(row.get("source_uri","")).lower():
+                                  placeholders += 1
+                              h1_objects.append((key,int(row["n_bytes"])))
+                          result_sizes=0
+                          for key,n_bytes in h1_objects:
+                              try:
+                                  object_head=s3.head_object(Bucket=source_bucket,Key=key)
+                                  if int(object_head["ContentLength"])==n_bytes:
+                                      result_sizes += 1
+                              except Exception:
+                                  pass
+                          report["h1_source_uri"]={
+                              "versions":len(h1_ids),
+                              "exact_expected_uri_matches":uri_matches,
+                              "placeholder_count":placeholders,
+                              "published_object_size_matches":result_sizes,
+                          }
+          
+                          # All frames across the H1-backed version population.
+                          frames=rows_by_ids(cur,"frame","document_version_id",h1_ids)
+                          frame_ids=[str(r["frame_id"]) for r in frames]
+                          report["h1_frames"]={
+                              "count":len(frames),
+                              "version_count":len({str(r["document_version_id"]) for r in frames}),
+                          }
+          
+                          sw_exists=table_exists(cur,"scan_window")
+                          at_exists=table_exists(cur,"scan_window_attempt")
+                          fa_exists=table_exists(cur,"frame_assessment")
+                          report["backfill_tables"]={
+                              "scan_window_exists":sw_exists,
+                              "scan_window_attempt_exists":at_exists,
+                              "frame_assessment_exists":fa_exists,
+                              "foreign_key_counts":{
+                                  t:fk_count(cur,t) if table_exists(cur,t) else 0
+                                  for t in ("scan_window","scan_window_attempt","frame_assessment")
+                              },
+                          }
+          
+                          windows: list[dict[str,Any]]=[]
+                          if sw_exists:
+                              sw_cols=table_columns(cur,"scan_window")
+                              sw_key=next((x for x in ("document_version_id","document_id") if x in sw_cols),None)
+                              if sw_key:
+                                  windows=rows_by_ids(cur,"scan_window",sw_key,h1_ids)
+                          window_ids=[
+                              str(r["scan_window_id"]) for r in windows
+                              if r.get("scan_window_id") is not None
+                          ]
+                          task_ids=sorted({
+                              str(r["task_run_id"]) for r in windows
+                              if r.get("task_run_id") is not None
+                          })
+          
+                          attempts: list[dict[str,Any]]=[]
+                          if at_exists:
+                              at_cols=table_columns(cur,"scan_window_attempt")
+                              at_key=next((x for x in ("scan_window_id","task_run_id") if x in at_cols),None)
+                              values=window_ids if at_key=="scan_window_id" else task_ids
+                              if at_key:
+                                  attempts=rows_by_ids(cur,"scan_window_attempt",at_key,values)
+                          attempt_ids={
+                              str(r.get("attempt_id")) for r in attempts
+                              if r.get("attempt_id") is not None
+                          }
+          
+                          assessments=rows_by_ids(cur,"frame_assessment","frame_id",frame_ids)
+                          fa_cols=table_columns(cur,"frame_assessment") if fa_exists else set()
+                          decision_col=next((c for c in ("decision","screen_decision","assessment") if c in fa_cols),None)
+                          category_col=next((c for c in ("category","content_category","assessment_category") if c in fa_cols),None)
+                          confidence_col=next((c for c in ("confidence","confidence_score") if c in fa_cols),None)
+                          counts=Counter(str(r.get("frame_id")) for r in assessments)
+                          report["assessment_backfill"]={
+                              "scan_windows":len(windows),
+                              "scan_window_attempts":len(attempts),
+                              "frame_assessments":len(assessments),
+                              "frames_without_assessment":sum(1 for fid in frame_ids if counts[fid]==0),
+                              "frames_with_multiple_assessments":sum(1 for fid in frame_ids if counts[fid]>1),
+                              "decision_counts":dict(Counter(str(r.get(decision_col) or "null") for r in assessments)) if decision_col else {},
+                              "category_counts":dict(Counter(str(r.get(category_col) or "null") for r in assessments)) if category_col else {},
+                              "confidence_half_count":sum(1 for r in assessments if float(r.get(confidence_col) or -1)==0.5) if confidence_col else None,
+                              "assessment_attempt_links":sum(
+                                  1 for r in assessments
+                                  if next((str(r.get(c)) for c in ("scan_window_attempt_id","attempt_id") if c in r),None) in attempt_ids
+                              ) if any(c in fa_cols for c in ("scan_window_attempt_id","attempt_id")) else None,
+                          }
+                          task_rows=rows_by_ids(cur,"task_run","task_run_id",task_ids)
+                          report["backfill_task_runs"]={
+                              "distinct_ids":len(task_ids),
+                              "records":len(task_rows),
+                              "statuses":dict(Counter(str(r.get("status") or "null") for r in task_rows)),
+                              "task_types":dict(Counter(str(r.get("task_type") or "null") for r in task_rows)),
+                          }
+          
+                          # Target report: verify Frame raw bytes and hashes, then all fact/evidence links.
+                          target_frames=rows_by_ids(cur,"frame","document_version_id",[version_id])
+                          frame_text={str(r["frame_id"]):str(r.get("text","")) for r in target_frames}
+                          frame_hash_ok=0
+                          frame_slice_ok=0
+                          spans=[]
+                          for row in target_frames:
+                              text_bytes=str(row.get("text","")).encode("utf-8")
+                              if hashlib.sha256(text_bytes).hexdigest()==str(row.get("content_sha256","")).lower():
+                                  frame_hash_ok += 1
+                              lo,hi=int(row["raw_start_byte"]),int(row["raw_end_byte"])
+                              spans.append((lo,hi))
+                              if 0<=lo<hi<=len(source_bytes) and source_bytes[lo:hi]==text_bytes:
+                                  frame_slice_ok += 1
+                          facts=rows_by_ids(cur,"business_fact","document_version_id",[version_id])
+                          fact_ids=[str(r["fact_id"]) for r in facts]
+                          evidences=rows_by_ids(cur,"fact_evidence","fact_id",fact_ids)
+                          quote_hash_ok=0
+                          quote_found=0
+                          for ev in evidences:
+                              quote=str(ev.get("quote_text",""))
+                              if quote and hashlib.sha256(quote.encode("utf-8")).hexdigest()==str(ev.get("quote_hash","")).lower():
+                                  quote_hash_ok += 1
+                              if quote and quote in frame_text.get(str(ev.get("frame_id")),""):
+                                  quote_found += 1
+                          report["target_research"]={
+                              "frame_count":len(target_frames),
+                              "frame_hash_matches":frame_hash_ok,
+                              "frame_source_slice_matches":frame_slice_ok,
+                              "frame_span_coverage":span_coverage(spans,len(source_bytes)),
+                              "business_fact_count":len(facts),
+                              "fact_type_counts":dict(Counter(str(r.get("fact_type")) for r in facts)),
+                              "confidence_one_count":sum(
+                                  1 for r in facts if r.get("confidence_score") is not None
+                                  and float(r["confidence_score"])==1.0
+                              ),
+                              "fact_evidence_count":len(evidences),
+                              "quote_hash_matches":quote_hash_ok,
+                              "quotes_found_in_linked_frames":quote_found,
+                          }
+          
+                          # Check Alembic tracking without creating or changing any schema object.
+                          cur.execute("SELECT to_regclass('public.alembic_version')")
+                          has_alembic=bool(cur.fetchone()[0])
+                          alembic_versions=[]
+                          if has_alembic:
+                              cur.execute("SELECT version_num FROM public.alembic_version")
+                              alembic_versions=[str(r[0]) for r in cur.fetchall()]
+                          cur.execute("SELECT to_regclass('research.schema_version')")
+                          has_schema_version=bool(cur.fetchone()[0])
+                          legacy_versions=[]
+                          if has_schema_version:
+                              cur.execute("SELECT version FROM research.schema_version")
+                              legacy_versions=[str(r[0]) for r in cur.fetchall()]
+                          report["migration_state"]={
+                              "alembic_version_table_exists":has_alembic,
+                              "alembic_versions":alembic_versions,
+                              "research_schema_versions":legacy_versions,
+                              "no_migration_definitions_for_backfill_tables":True,
+                          }
+          
+                  # Check both the documented DEV bucket and the bucket named by the execution report.
+                  # All operations below are HEAD/LIST/GET only.
+                  bucket_results={}
+                  for bucket in (DEV_BUCKET,LEGACY_REPORTED_BUCKET):
+                      try:
+                          page=s3.list_objects_v2(Bucket=bucket,Prefix=RESULT_PREFIX,MaxKeys=100)
+                          objects=page.get("Contents",[])
+                          valid_json=0
+                          source_hash_refs=0
+                          for item in objects:
+                              obj=s3.get_object(Bucket=bucket,Key=item["Key"])
+                              try:
+                                  raw=obj["Body"].read()
+                              finally:
+                                  obj["Body"].close()
+                              if str(item["Key"]).lower().endswith(".json"):
+                                  parsed=json.loads(raw.decode("utf-8",errors="strict"))
+                                  valid_json += 1
+                                  source_hash_refs += sum(1 for h in hashes_in(parsed) if h==source_hash)
+                          bucket_results[bucket]={
+                              "object_count":len(objects),
+                              "valid_json_count":valid_json,
+                              "source_hash_references":source_hash_refs,
+                          }
+                      except Exception as exc:
+                          bucket_results[bucket]={"access_error":type(exc).__name__}
+                  report["research_rustfs_prefixes"]=bucket_results
+          
+                  checks={
+                      "source_is_458990_bytes":report["source"]["bytes"]==EXPECTED_BYTES,
+                      "source_hash_matches_document_version":report["target_document_version"]["source_hash_matches"],
+                      "target_source_uri_is_correct":report["target_document_version"]["source_uri_matches_expected_key"],
+                      "target_source_size_matches":report["target_document_version"]["byte_count_matches"],
+                      "all_46_h1_source_uris_correct":report["h1_source_uri"]["versions"]==46 and report["h1_source_uri"]["exact_expected_uri_matches"]==46,
+                      "no_h1_placeholder_uris":report["h1_source_uri"]["placeholder_count"]==0,
+                      "all_46_published_sizes_match":report["h1_source_uri"]["published_object_size_matches"]==46,
+                      "72_h1_frames":report["h1_frames"]["count"]==72,
+                      "72_h1_assessments":report["assessment_backfill"]["frame_assessments"]==72,
+                      "46_scan_windows":report["assessment_backfill"]["scan_windows"]==46,
+                      "46_scan_attempts":report["assessment_backfill"]["scan_window_attempts"]==46,
+                      "no_frame_without_assessment":report["assessment_backfill"]["frames_without_assessment"]==0,
+                      "target_8_frames":report["target_research"]["frame_count"]==8,
+                      "target_40_facts":report["target_research"]["business_fact_count"]==40,
+                      "target_40_evidence":report["target_research"]["fact_evidence_count"]==40,
+                  }
+                  report["checks"]=checks
+                  report["passed"]=sum(1 for v in checks.values() if v)
+                  report["total"]=len(checks)
+                  report["status"]="PASS" if all(checks.values()) else "REVIEW_REQUIRED"
+                  # Never output IDs, source text, fact values, object keys, credentials, or full hashes.
+                  print(json.dumps(report,ensure_ascii=False,sort_keys=True,default=str))
+              except Exception as exc:
+                  print(json.dumps({
+                      "audit":"002452_2025_4",
+                      "status":"BLOCKED",
+                      "error_type":type(exc).__name__,
+                  }))
+                  sys.exit(1)
+          
+          if __name__=="__main__":
+              main()
+          
+          PY
+
+      - name: Stop tunnel and remove secret material
+        if: always()
+        run: |
+          work="$RUNNER_TEMP/research-audit"
+          if [ -s "$work/stunnel.pid" ]; then
+            pid="$(cat "$work/stunnel.pid")"
+            [ -z "$pid" ] || kill "$pid" 2>/dev/null || true
+          fi
+          rm -f "$work/stunnel.pid" "$work/stunnel.conf" "$work/k-ci.psk" "$work/runtime.env"
