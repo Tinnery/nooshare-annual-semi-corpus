@@ -196,21 +196,17 @@ jobs:
                       cur.execute(
                           """
                           SELECT
+                              has_database_privilege(current_user, current_database(), 'CREATE'),
                               has_schema_privilege(current_user, 'research', 'USAGE'),
                               has_schema_privilege(current_user, 'research', 'CREATE')
                           """
                       )
-                      schema_usage, schema_create = cur.fetchone()
-                      if not schema_usage or schema_create:
-                          raise RuntimeError("Research schema privileges are outside policy")
+                      database_create, schema_usage, schema_create = cur.fetchone()
+                      if database_create or not schema_usage or schema_create:
+                          raise RuntimeError("Research database/schema privileges are outside policy")
 
                       required = {
                           "research.task_run": ("SELECT", "INSERT", "UPDATE"),
-                          "research.document": ("SELECT", "INSERT"),
-                          "research.document_version": ("SELECT", "INSERT"),
-                          "research.frame": ("SELECT", "INSERT"),
-                          "research.business_fact": ("SELECT", "INSERT"),
-                          "research.fact_evidence": ("SELECT", "INSERT"),
                       }
                       for table_name, privileges in required.items():
                           cur.execute("SELECT to_regclass(%s)", (table_name,))
