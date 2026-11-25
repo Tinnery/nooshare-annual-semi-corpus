@@ -991,13 +991,26 @@ jobs:
                           h1_ids=sorted({str(r["document_version_id"]) for r in h1})
                           uri_matches=0
                           placeholders=0
+                          uri_classes=Counter()
                           h1_objects=[]
                           for row in h1:
                               key=f"published/{str(row['stock_code']).zfill(6)}/{row['slot_key']}.md"
-                              if row.get("source_uri")=="rustfs://"+key:
+                              source_uri=str(row.get("source_uri") or "")
+                              expected_uri="rustfs://"+key
+                              if source_uri==expected_uri:
                                   uri_matches += 1
-                              if "placeholder" in str(row.get("source_uri","")).lower():
+                                  uri_classes["exact_expected_uri"] += 1
+                              elif not source_uri:
+                                  uri_classes["empty_uri"] += 1
+                              elif "placeholder" in source_uri.lower():
                                   placeholders += 1
+                                  uri_classes["placeholder_uri"] += 1
+                              elif source_uri.startswith("rustfs://published/"):
+                                  uri_classes["published_key_mismatch"] += 1
+                              elif source_uri.startswith("rustfs://"):
+                                  uri_classes["other_rustfs_uri"] += 1
+                              else:
+                                  uri_classes["other_uri_scheme"] += 1
                               h1_objects.append((key,int(row["n_bytes"])))
                           result_sizes=0
                           for key,n_bytes in h1_objects:
@@ -1011,6 +1024,7 @@ jobs:
                               "versions":len(h1_ids),
                               "exact_expected_uri_matches":uri_matches,
                               "placeholder_count":placeholders,
+                              "uri_classification_counts":dict(uri_classes),
                               "published_object_size_matches":result_sizes,
                           }
           
@@ -1151,7 +1165,7 @@ jobs:
                               "alembic_version_table_exists":has_alembic,
                               "alembic_versions":alembic_versions,
                               "research_schema_versions":legacy_versions,
-                              "no_migration_definitions_for_backfill_tables":True,
+                              "migration_source_files_checked":False,
                           }
           
                   stage="inspect_rustfs_research_prefixes"
@@ -1183,22 +1197,44 @@ jobs:
                           bucket_results[bucket]={"access_error":type(exc).__name__}
                   report["research_rustfs_prefixes"]=bucket_results
           
+                  dev_objects=report["research_rustfs_prefixes"].get(DEV_BUCKET,{})
                   checks={
                       "source_is_458990_bytes":report["source"]["bytes"]==EXPECTED_BYTES,
                       "source_hash_matches_document_version":report["target_document_version"]["source_hash_matches"],
                       "target_source_uri_is_correct":report["target_document_version"]["source_uri_matches_expected_key"],
                       "target_source_size_matches":report["target_document_version"]["byte_count_matches"],
-                      "all_46_h1_source_uris_correct":report["h1_source_uri"]["versions"]==46 and report["h1_source_uri"]["exact_expected_uri_matches"]==46,
+                      "all_h1_source_uris_match_published_keys":(
+                          report["h1_source_uri"]["versions"]>0
+                          and report["h1_source_uri"]["exact_expected_uri_matches"]==report["h1_source_uri"]["versions"]
+                      ),
                       "no_h1_placeholder_uris":report["h1_source_uri"]["placeholder_count"]==0,
-                      "all_46_published_sizes_match":report["h1_source_uri"]["published_object_size_matches"]==46,
-                      "72_h1_frames":report["h1_frames"]["count"]==72,
-                      "72_h1_assessments":report["assessment_backfill"]["frame_assessments"]==72,
-                      "46_scan_windows":report["assessment_backfill"]["scan_windows"]==46,
-                      "46_scan_attempts":report["assessment_backfill"]["scan_window_attempts"]==46,
-                      "no_frame_without_assessment":report["assessment_backfill"]["frames_without_assessment"]==0,
-                      "target_8_frames":report["target_research"]["frame_count"]==8,
-                      "target_40_facts":report["target_research"]["business_fact_count"]==40,
-                      "target_40_evidence":report["target_research"]["fact_evidence_count"]==40,
+                      "all_h1_published_sizes_match":(
+                          report["h1_source_uri"]["versions"]>0
+                          and report["h1_source_uri"]["published_object_size_matches"]==report["h1_source_uri"]["versions"]
+                      ),
+                      "all_h1_frames_have_an_assessment":report["assessment_backfill"]["frames_without_assessment"]==0,
+                      "research_outputs_are_in_dev_bucket":(
+                          int(dev_objects.get("object_count",0))>0
+                          and int(dev_objects.get("valid_json_count",0))==int(dev_objects.get("object_count",0))
+                      ),
+                      "target_frame_hashes_match":(
+                          report["target_research"]["frame_count"]>0
+                          and report["target_research"]["frame_hash_matches"]==report["target_research"]["frame_count"]
+                      ),
+                      "target_frames_are_exact_source_slices":(
+                          report["target_research"]["frame_count"]>0
+                          and report["target_research"]["frame_source_slice_matches"]==report["target_research"]["frame_count"]
+                      ),
+                      "target_business_facts_present":report["target_research"]["business_fact_count"]==40,
+                      "target_fact_evidence_present":report["target_research"]["fact_evidence_count"]==40,
+                      "target_evidence_hashes_match":(
+                          report["target_research"]["fact_evidence_count"]>0
+                          and report["target_research"]["quote_hash_matches"]==report["target_research"]["fact_evidence_count"]
+                      ),
+                      "target_evidence_quotes_are_in_linked_frames":(
+                          report["target_research"]["fact_evidence_count"]>0
+                          and report["target_research"]["quotes_found_in_linked_frames"]==report["target_research"]["fact_evidence_count"]
+                      ),
                   }
                   report["checks"]=checks
                   report["passed"]=sum(1 for v in checks.values() if v)
@@ -1206,6 +1242,8 @@ jobs:
                   report["status"]="PASS" if all(checks.values()) else "REVIEW_REQUIRED"
                   # Never output IDs, source text, fact values, object keys, credentials, or full hashes.
                   print(json.dumps(report,ensure_ascii=False,sort_keys=True,default=str))
+                  if not all(checks.values()):
+                      sys.exit(2)
               except Exception as exc:
                   print(json.dumps({
                       "audit":"002452_2025_4",
