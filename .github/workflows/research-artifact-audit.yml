@@ -260,6 +260,35 @@ jobs:
                       "source_bucket_matches_research_reader":source_bucket=="annual-semi",
                   }
           
+                  # Inspect both possible research-output locations before the PostgreSQL read gate.
+                  # Only HEAD/LIST/GET are used; the expected DEV bucket is nooshare-dev.
+                  stage="inspect_rustfs_prefixes_before_pg"
+                  early_bucket_results={}
+                  for bucket in (DEV_BUCKET,LEGACY_REPORTED_BUCKET):
+                      try:
+                          page=s3.list_objects_v2(Bucket=bucket,Prefix=RESULT_PREFIX,MaxKeys=100)
+                          objects=page.get("Contents",[])
+                          valid_json=0
+                          source_hash_refs=0
+                          for item in objects:
+                              obj=s3.get_object(Bucket=bucket,Key=item["Key"])
+                              try:
+                                  raw=obj["Body"].read()
+                              finally:
+                                  obj["Body"].close()
+                              if str(item["Key"]).lower().endswith(".json"):
+                                  parsed=json.loads(raw.decode("utf-8",errors="strict"))
+                                  valid_json += 1
+                                  source_hash_refs += sum(1 for h in hashes_in(parsed) if h==source_hash)
+                          early_bucket_results[bucket]={
+                              "object_count":len(objects),
+                              "valid_json_count":valid_json,
+                              "source_hash_references":source_hash_refs,
+                          }
+                      except Exception as exc:
+                          early_bucket_results[bucket]={"access_error":type(exc).__name__}
+                  report["research_rustfs_prefixes_before_pg"]=early_bucket_results
+
                   # Inspect the exact DEV database only, with the PostgreSQL transaction forced read-only.
                   stage="connect_postgresql"
                   with psycopg.connect(
@@ -576,6 +605,8 @@ jobs:
                       "stage":stage,
                       "error_type":type(exc).__name__,
                       "permission_probe":report.get("research_read_grants"),
+                      "source":report.get("source"),
+                      "research_rustfs_prefixes":report.get("research_rustfs_prefixes_before_pg"),
                   }))
                   sys.exit(1)
           
