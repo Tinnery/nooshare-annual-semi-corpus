@@ -328,6 +328,12 @@ jobs:
                           """,
                           (probe_id, "ci_research_preflight", "1", config_hash),
                       )
+                      cur.execute(
+                          "UPDATE research.task_run SET status = %s WHERE task_run_id = %s",
+                          ("running", probe_id),
+                      )
+                      if cur.rowcount != 1:
+                          raise RuntimeError("The PostgreSQL UPDATE permission probe failed")
                       conn.rollback()
                       with conn.cursor() as probe_cur:
                           probe_cur.execute(
@@ -349,7 +355,6 @@ jobs:
                   aws_secret_access_key=secret_key,
                   region_name="us-east-1",
                   config=botocore.config.Config(
-                      proxies={"http": None, "https": None},
                       connect_timeout=10,
                       read_timeout=60,
                       retries={"max_attempts": 2, "mode": "standard"},
