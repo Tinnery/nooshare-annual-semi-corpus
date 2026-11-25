@@ -314,6 +314,78 @@ jobs:
                           for r in running
                       ]
 
+                      def json_keys(value: Any) -> list[str]:
+                          if isinstance(value, dict):
+                              return sorted(str(k) for k in value.keys())
+                          if isinstance(value, str):
+                              try:
+                                  parsed = json.loads(value)
+                              except json.JSONDecodeError:
+                                  return []
+                              return sorted(str(k) for k in parsed.keys()) if isinstance(parsed, dict) else []
+                          return []
+
+                      running_ids = [str(r[0]) for r in running]
+                      running_detail = []
+                      for task_id in running_ids:
+                          cur.execute("SELECT * FROM research.task_run WHERE task_run_id=%s", (task_id,))
+                          desc = [d.name for d in cur.description]
+                          task_detail = dict(zip(desc, cur.fetchone()))
+                          running_detail.append({
+                              "task_run_id": task_id,
+                              "input_manifest_keys": json_keys(task_detail.get("input_manifest")),
+                              "checkpoint_keys": json_keys(task_detail.get("checkpoint")),
+                              "output_manifest_keys": json_keys(task_detail.get("output_manifest")),
+                              "error_details_present": bool(task_detail.get("error_details")),
+                              "attempt_count": task_detail.get("attempt_count"),
+                              "started_at_present": task_detail.get("started_at") is not None,
+                              "completed_at_present": task_detail.get("completed_at") is not None,
+                              "heartbeat_present": task_detail.get("last_heartbeat_at") is not None,
+                          })
+                      report["running_task_run_context"] = running_detail
+
+                      cur.execute(
+                          """
+                          SELECT sw.task_run_id, sw.status, count(DISTINCT sw.scan_window_id),
+                                 count(DISTINCT swa.attempt_id)
+                          FROM research.scan_window sw
+                          LEFT JOIN research.scan_window_attempt swa
+                            ON swa.scan_window_id=sw.scan_window_id
+                          WHERE sw.task_run_id = ANY(%s)
+                          GROUP BY sw.task_run_id, sw.status
+                          ORDER BY sw.task_run_id, sw.status
+                          """,
+                          (running_ids,),
+                      )
+                      report["running_task_run_windows"] = [
+                          {
+                              "task_run_id": r[0], "window_status": r[1],
+                              "window_count": r[2], "attempt_count": r[3],
+                          }
+                          for r in cur.fetchall()
+                      ]
+                      cur.execute(
+                          """
+                          SELECT sw.task_run_id, swa.status, count(*)
+                          FROM research.scan_window sw
+                          JOIN research.scan_window_attempt swa
+                            ON swa.scan_window_id=sw.scan_window_id
+                          WHERE sw.task_run_id = ANY(%s)
+                          GROUP BY sw.task_run_id, swa.status
+                          ORDER BY sw.task_run_id, swa.status
+                          """,
+                          (running_ids,),
+                      )
+                      report["running_task_run_attempts"] = [
+                          {"task_run_id": r[0], "attempt_status": r[1], "count": r[2]}
+                          for r in cur.fetchall()
+                      ]
+                      report["target_task_run"]["created_after_completed"] = (
+                          task.get("created_at") is not None
+                          and task.get("completed_at") is not None
+                          and task["created_at"] > task["completed_at"]
+                      )
+
                       fk_all = foreign_keys(cur)
                       table_info: dict[str, Any] = {}
                       for table in ("scan_window", "scan_window_attempt", "frame_assessment"):
@@ -513,6 +585,87 @@ jobs:
                                   "whitespace_normalized_quote_in_linked_frame",
                               )
                           },
+                      }
+
+                      frame_metadata = []
+                      for f in target_frames:
+                          frame_text = str(f.get("text", ""))
+                          path_value = f.get("section_path")
+                          if isinstance(path_value, str):
+                              try:
+                                  path_value = json.loads(path_value)
+                              except json.JSONDecodeError:
+                                  path_value = []
+                          canonical_categories = []
+                          if isinstance(path_value, list):
+                              canonical_categories = sorted({
+                                  str(x.get("canonical_cat"))
+                                  for x in path_value
+                                  if isinstance(x, dict) and x.get("canonical_cat") is not None
+                              })
+                          frame_metadata.append({
+                              "frame_id_prefix": str(f["frame_id"])[:12],
+                              "frame_type": f.get("frame_type"),
+                              "parser_version": f.get("parser_version"),
+                              "raw_start_byte": int(f["raw_start_byte"]),
+                              "raw_end_byte": int(f["raw_end_byte"]),
+                              "raw_span_bytes": int(f["raw_end_byte"]) - int(f["raw_start_byte"]),
+                              "text_utf8_bytes": len(frame_text.encode("utf-8")),
+                              "text_characters": len(frame_text),
+                              "canonical_categories": canonical_categories,
+                          })
+                      report["target_frame_metadata"] = frame_metadata
+
+                      fact_by_id = {str(f["fact_id"]): f for f in facts}
+                      quote_equals_fact_evidence = 0
+                      normalized_quote_equals_fact = 0
+                      fact_evidence_source_hits = 0
+                      fact_text_source_hits = 0
+                      fact_text_linked_frame_hits = 0
+                      extract_models = Counter()
+                      extract_versions = Counter()
+                      for f in facts:
+                          extract_models[str(f.get("extraction_model") or "null")] += 1
+                          extract_versions[str(f.get("extraction_version") or "null")] += 1
+                          evidence_text = str(f.get("evidence_text") or "")
+                          if evidence_text and source.find(evidence_text.encode("utf-8")) >= 0:
+                              fact_text_source_hits += 1
+                          linked = target_frame_text.get(str(f.get("frame_id")), "")
+                          if evidence_text and evidence_text in linked:
+                              fact_text_linked_frame_hits += 1
+                      for ev in evidences:
+                          fact = fact_by_id.get(str(ev.get("fact_id")))
+                          quote = str(ev.get("quote_text") or "")
+                          fact_evidence = str(fact.get("evidence_text") or "") if fact else ""
+                          if quote and quote == fact_evidence:
+                              quote_equals_fact_evidence += 1
+                          if quote and fact_evidence and norm_text(quote) == norm_text(fact_evidence):
+                              normalized_quote_equals_fact += 1
+                          if quote and source.find(quote.encode("utf-8")) >= 0:
+                              fact_evidence_source_hits += 1
+                      report["fact_evidence_provenance"] = {
+                          "extraction_models": dict(extract_models),
+                          "extraction_versions": dict(extract_versions),
+                          "quote_equals_business_fact_evidence_text": quote_equals_fact_evidence,
+                          "normalized_quote_equals_business_fact_evidence_text": normalized_quote_equals_fact,
+                          "business_fact_evidence_text_found_in_source": fact_text_source_hits,
+                          "business_fact_evidence_text_found_in_linked_frame": fact_text_linked_frame_hits,
+                          "fact_evidence_quote_found_in_source": fact_evidence_source_hits,
+                      }
+
+                      business_fact_columns = columns(cur, "business_fact")
+                      report["business_fact_task_run_lineage"] = {
+                          "task_run_id_column_present": any(c["name"] == "task_run_id" for c in business_fact_columns),
+                          "task_run_id_column": next((c for c in business_fact_columns if c["name"] == "task_run_id"), None),
+                          "foreign_keys": [
+                              f for f in fk_all
+                              if f["source_table"] == "business_fact"
+                              and f["source_column"] == "task_run_id"
+                          ],
+                          "indexes": [
+                              x for x in index_definitions(cur, "business_fact")
+                              if "task_run_id" in x
+                          ],
                       }
 
                       # Snapshot actual live DDL for the three drifted tables.
