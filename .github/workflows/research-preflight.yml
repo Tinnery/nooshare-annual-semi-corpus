@@ -233,13 +233,18 @@ jobs:
                               raise RuntimeError("The Research role cannot read the report registry")
                       cur.execute(
                           """
-                          SELECT
-                              has_schema_privilege(current_user, 'annual_semi', 'CREATE'),
-                              has_schema_privilege(current_user, 'iwen', 'CREATE')
+                          SELECT EXISTS (
+                              SELECT 1
+                              FROM pg_catalog.pg_namespace AS n
+                              WHERE n.nspname !~ '^pg_'
+                                AND n.nspname <> 'information_schema'
+                                AND n.nspname <> 'research'
+                                AND has_schema_privilege(current_user, n.oid, 'CREATE')
+                          )
                           """
                       )
-                      if any(cur.fetchone()):
-                          raise RuntimeError("The Research role can create objects in upstream schemas")
+                      if cur.fetchone()[0]:
+                          raise RuntimeError("The Research role can create objects outside its schema")
 
                       cur.execute(
                           """
@@ -248,7 +253,9 @@ jobs:
                               FROM pg_catalog.pg_class AS c
                               JOIN pg_catalog.pg_namespace AS n
                                 ON n.oid = c.relnamespace
-                              WHERE n.nspname IN ('annual_semi', 'iwen')
+                              WHERE n.nspname !~ '^pg_'
+                                AND n.nspname <> 'information_schema'
+                                AND n.nspname <> 'research'
                                 AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
                                 AND (
                                   has_table_privilege(current_user, c.oid, 'INSERT')
@@ -260,7 +267,37 @@ jobs:
                           """
                       )
                       if cur.fetchone()[0]:
-                          raise RuntimeError("The Research role can write upstream corpus tables")
+                          raise RuntimeError("The Research role can write tables outside its schema")
+
+                      cur.execute(
+                          """
+                          SELECT EXISTS (
+                              SELECT 1
+                              FROM pg_catalog.pg_class AS c
+                              WHERE c.relnamespace = 'research'::regnamespace
+                                AND c.relname <> 'task_run'
+                                AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+                                AND (
+                                  has_table_privilege(current_user, c.oid, 'INSERT')
+                                  OR has_table_privilege(current_user, c.oid, 'UPDATE')
+                                  OR has_table_privilege(current_user, c.oid, 'DELETE')
+                                  OR has_table_privilege(current_user, c.oid, 'TRUNCATE')
+                                )
+                          )
+                          """
+                      )
+                      if cur.fetchone()[0]:
+                          raise RuntimeError("The Research role can write Research tables outside task_run")
+
+                      cur.execute(
+                          """
+                          SELECT
+                              has_table_privilege(current_user, 'research.task_run', 'DELETE'),
+                              has_table_privilege(current_user, 'research.task_run', 'TRUNCATE')
+                          """
+                      )
+                      if any(cur.fetchone()):
+                          raise RuntimeError("The Research role can destructively modify task_run")
 
                       cur.execute(
                           "SELECT source_uri FROM annual_semi.reconciled_report WHERE slot_key = %s",
