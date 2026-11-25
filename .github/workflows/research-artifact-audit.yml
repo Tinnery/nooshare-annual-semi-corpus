@@ -703,6 +703,36 @@ jobs:
               main()
           PY
 
+      - name: Refresh CI tunnel before H1-wide audit
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/research-audit"
+          stunnel_bin="$(command -v stunnel || command -v stunnel4)"
+
+          if [ -s "$work/stunnel.pid" ]; then
+            pid="$(cat "$work/stunnel.pid")"
+            [ -z "$pid" ] || kill "$pid" 2>/dev/null || true
+            for _ in $(seq 1 10); do
+              kill -0 "$pid" 2>/dev/null || break
+              sleep 1
+            done
+          fi
+          rm -f "$work/stunnel.pid"
+
+          "$stunnel_bin" "$work/stunnel.conf"
+          test -s "$work/stunnel.pid"
+          for port in 15432 15500; do
+            ready=0
+            for _ in $(seq 1 30); do
+              if ss -ltn 2>/dev/null | grep -q "127.0.0.1:$port"; then
+                ready=1
+                break
+              fi
+              sleep 1
+            done
+            [ "$ready" -eq 1 ] || exit 1
+          done
+
       - name: Run read-only Research output audit
         run: |
           set -a
