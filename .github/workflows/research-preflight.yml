@@ -1,0 +1,391 @@
+name: Research Preflight
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: research-preflight-main
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Research DEV access preflight (002452_2025_4)
+    if: github.ref == 'refs/heads/main' && vars.RESEARCH_EXECUTOR_ENABLED == 'true'
+    environment:
+      name: research-executor
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out the dispatched main commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+
+      - name: Install stunnel and project dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends stunnel4
+          uv sync --frozen --extra dev --python 3.12
+
+      # This job deliberately does not consume NOOSHARE_INFRA.
+      # RESEARCH_TUNNEL contains only the tunnel host and the PSK identity.
+      - name: Prepare isolated PostgreSQL and RustFS tunnels
+        env:
+          RESEARCH_TUNNEL: ${{ secrets.RESEARCH_TUNNEL }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          raw = os.environ.get("RESEARCH_TUNNEL", "")
+          if not raw:
+              raise SystemExit("Missing Environment secret: RESEARCH_TUNNEL")
+
+          try:
+              tunnel = json.loads(raw)
+          except json.JSONDecodeError:
+              raise SystemExit("RESEARCH_TUNNEL must be valid JSON") from None
+
+          host = tunnel.get("stunnel_host")
+          psk = tunnel.get("stunnel_psk")
+          if not isinstance(host, str) or not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+              raise SystemExit("RESEARCH_TUNNEL has an invalid stunnel_host")
+          if not isinstance(psk, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+:[0-9A-Fa-f]{64}", psk):
+              raise SystemExit("RESEARCH_TUNNEL has an invalid stunnel_psk")
+
+          work_dir = Path(os.environ["RUNNER_TEMP"]) / "research-preflight"
+          work_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+          os.chmod(work_dir, 0o700)
+
+          psk_file = work_dir / "research.psk"
+          psk_file.write_text(psk + "\\n", encoding="utf-8")
+          os.chmod(psk_file, 0o600)
+
+          pid_file = work_dir / "stunnel.pid"
+          log_file = work_dir / "stunnel.log"
+          conf_file = work_dir / "stunnel.conf"
+          conf_lines = [
+              "pid = " + str(pid_file),
+              "output = " + str(log_file),
+              "",
+              "[postgresql]",
+              "client = yes",
+              "accept = 127.0.0.1:15432",
+              "connect = " + host + ":27002",
+              "sni = pg.noos.com",
+              "ciphers = PSK",
+              "PSKsecrets = " + str(psk_file),
+              "",
+              "[rustfs]",
+              "client = yes",
+              "accept = 127.0.0.1:15500",
+              "connect = " + host + ":27002",
+              "sni = rustfs.noos.com",
+              "ciphers = PSK",
+              "PSKsecrets = " + str(psk_file),
+              "",
+          ]
+          conf_file.write_text("\\n".join(conf_lines), encoding="utf-8")
+          os.chmod(conf_file, 0o600)
+          PY
+
+      - name: Start stunnel
+        run: |
+          work_dir="$RUNNER_TEMP/research-preflight"
+          stunnel_bin="$(command -v stunnel || command -v stunnel4)"
+          "$stunnel_bin" "$work_dir/stunnel.conf"
+
+          for _ in $(seq 1 30); do
+            if [ -s "$work_dir/stunnel.pid" ]; then
+              break
+            fi
+            sleep 1
+          done
+          test -s "$work_dir/stunnel.pid"
+
+      - name: Wait for local tunnel listeners
+        run: |
+          for port in 15432 15500; do
+            ready=0
+            for _ in $(seq 1 30); do
+              if ss -ltn 2>/dev/null | grep -q "127.0.0.1:$port"; then
+                ready=1
+                break
+              fi
+              sleep 1
+            done
+            if [ "$ready" -ne 1 ]; then
+              echo "Required local tunnel listener is not ready" >&2
+              exit 1
+            fi
+          done
+
+      # Environment secrets are injected into this step only.
+      # The report body is never emitted to public Actions logs or artifacts.
+      - name: Verify source read and Research DEV write boundaries
+        env:
+          RESEARCH_PG_USER: ${{ secrets.RESEARCH_PG_USER }}
+          RESEARCH_PG_PASSWORD: ${{ secrets.RESEARCH_PG_PASSWORD }}
+          RESEARCH_RUSTFS_ACCESS_KEY: ${{ secrets.RESEARCH_RUSTFS_ACCESS_KEY }}
+          RESEARCH_RUSTFS_SECRET_KEY: ${{ secrets.RESEARCH_RUSTFS_SECRET_KEY }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          uv run python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+          from datetime import datetime, timezone
+
+          import boto3
+          import botocore.config
+          import psycopg
+
+          from annual_semi_corpus.core import build_md_key
+
+          SLOT_KEY = "002452_2025_4"
+          DATABASE = "nooshare_dev"
+          BUCKET = "nooshare-dev"
+          OUTPUT_PREFIX = "research/annual-report-evidence/_ci-preflight/"
+
+          def require_env(name: str) -> str:
+              value = os.environ.get(name, "")
+              if not value:
+                  raise RuntimeError("required Environment secret is missing")
+              return value
+
+          def verify_postgres() -> None:
+              user = require_env("RESEARCH_PG_USER")
+              password = require_env("RESEARCH_PG_PASSWORD")
+
+              with psycopg.connect(
+                  host="127.0.0.1",
+                  port=15432,
+                  dbname=DATABASE,
+                  user=user,
+                  password=password,
+                  connect_timeout=10,
+                  application_name="nooshare-corpus-research-preflight",
+              ) as conn:
+                  with conn.cursor() as cur:
+                      cur.execute(
+                          """
+                          SELECT r.rolsuper, r.rolcreatedb, r.rolcreaterole
+                          FROM pg_roles AS r
+                          WHERE r.rolname = current_user
+                          """
+                      )
+                      role = cur.fetchone()
+                      if role is None or any(role):
+                          raise RuntimeError("Research DB role is not least-privilege")
+
+                      cur.execute(
+                          """
+                          SELECT
+                              has_schema_privilege(current_user, 'research', 'USAGE'),
+                              has_schema_privilege(current_user, 'research', 'CREATE')
+                          """
+                      )
+                      schema_usage, schema_create = cur.fetchone()
+                      if not schema_usage or schema_create:
+                          raise RuntimeError("Research schema privileges are outside policy")
+
+                      required = {
+                          "research.task_run": ("SELECT", "INSERT", "UPDATE"),
+                          "research.document": ("SELECT", "INSERT"),
+                          "research.document_version": ("SELECT", "INSERT"),
+                          "research.frame": ("SELECT", "INSERT"),
+                          "research.business_fact": ("SELECT", "INSERT"),
+                          "research.fact_evidence": ("SELECT", "INSERT"),
+                      }
+                      for table_name, privileges in required.items():
+                          cur.execute("SELECT to_regclass(%s)", (table_name,))
+                          if cur.fetchone()[0] is None:
+                              raise RuntimeError("A required Research table is missing")
+                          for privilege in privileges:
+                              cur.execute(
+                                  "SELECT has_table_privilege(current_user, %s, %s)",
+                                  (table_name, privilege),
+                              )
+                              if not cur.fetchone()[0]:
+                                  raise RuntimeError("A required Research table privilege is missing")
+
+                      upstream_table = "annual_semi.reconciled_report"
+                      cur.execute("SELECT to_regclass(%s)", (upstream_table,))
+                      if cur.fetchone()[0] is None:
+                          raise RuntimeError("The upstream report registry is unavailable")
+                      for privilege in ("SELECT",):
+                          cur.execute(
+                              "SELECT has_table_privilege(current_user, %s, %s)",
+                              (upstream_table, privilege),
+                          )
+                          if not cur.fetchone()[0]:
+                              raise RuntimeError("The Research role cannot read the report registry")
+                      for privilege in ("INSERT", "UPDATE", "DELETE", "TRUNCATE"):
+                          cur.execute(
+                              "SELECT has_table_privilege(current_user, %s, %s)",
+                              (upstream_table, privilege),
+                          )
+                          if cur.fetchone()[0]:
+                              raise RuntimeError("The Research role can write upstream corpus data")
+
+                      cur.execute(
+                          "SELECT source_uri FROM annual_semi.reconciled_report WHERE slot_key = %s",
+                          (SLOT_KEY,),
+                      )
+                      rows = cur.fetchall()
+                      if len(rows) != 1:
+                          raise RuntimeError("The selected report slot is not uniquely registered")
+                      if not rows[0][0]:
+                          raise RuntimeError("The selected report has no registered source URI")
+
+                      # Prove INSERT without leaving a row behind.
+                      run_id = os.environ["GITHUB_RUN_ID"]
+                      attempt = os.environ["GITHUB_RUN_ATTEMPT"]
+                      probe_id = f"ci-preflight-{run_id}-{attempt}"
+                      config_hash = hashlib.sha256(
+                          f"{SLOT_KEY}:{probe_id}".encode("utf-8")
+                      ).hexdigest()
+                      cur.execute(
+                          """
+                          INSERT INTO research.task_run (
+                              task_run_id, task_type, task_version, config_hash
+                          ) VALUES (%s, %s, %s, %s)
+                          """,
+                          (probe_id, "ci_research_preflight", "1", config_hash),
+                      )
+                      conn.rollback()
+                      cur = conn.cursor()
+                      cur.execute(
+                          "SELECT 1 FROM research.task_run WHERE task_run_id = %s",
+                          (probe_id,),
+                      )
+                      if cur.fetchone() is not None:
+                          raise RuntimeError("The PostgreSQL permission probe was not rolled back")
+                      conn.rollback()
+
+          def verify_rustfs() -> tuple[int, str]:
+              access_key = require_env("RESEARCH_RUSTFS_ACCESS_KEY")
+              secret_key = require_env("RESEARCH_RUSTFS_SECRET_KEY")
+
+              s3 = boto3.client(
+                  "s3",
+                  endpoint_url="http://127.0.0.1:15500",
+                  aws_access_key_id=access_key,
+                  aws_secret_access_key=secret_key,
+                  region_name="us-east-1",
+                  config=botocore.config.Config(
+                      proxies={"http": None, "https": None},
+                      connect_timeout=10,
+                      read_timeout=60,
+                      retries={"max_attempts": 2, "mode": "standard"},
+                  ),
+              )
+
+              match = re.fullmatch(r"(\\d{6})_(\\d{4})_([24])", SLOT_KEY)
+              if match is None:
+                  raise RuntimeError("The fixed report slot key is invalid")
+              code, year, period = match.groups()
+              source_key = build_md_key(code, int(year), int(period))
+
+              head = s3.head_object(Bucket=BUCKET, Key=source_key)
+              response = s3.get_object(Bucket=BUCKET, Key=source_key)
+              try:
+                  content = response["Body"].read()
+              finally:
+                  response["Body"].close()
+
+              if len(content) != head["ContentLength"] or not content:
+                  raise RuntimeError("The source Markdown size check failed")
+              content.decode("utf-8", errors="strict")
+              source_hash = hashlib.sha256(content).hexdigest()
+
+              marker_key = (
+                  OUTPUT_PREFIX
+                  + SLOT_KEY
+                  + "/"
+                  + os.environ["GITHUB_RUN_ID"]
+                  + "-"
+                  + os.environ["GITHUB_RUN_ATTEMPT"]
+                  + ".json"
+              )
+              marker = {
+                  "schema_version": 1,
+                  "kind": "research-dev-preflight",
+                  "slot_key": SLOT_KEY,
+                  "source_bytes": len(content),
+                  "source_sha256": source_hash,
+                  "run": {
+                      "repository": os.environ["GITHUB_REPOSITORY"],
+                      "run_id": os.environ["GITHUB_RUN_ID"],
+                      "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+                      "commit": os.environ["GITHUB_SHA"],
+                  },
+                  "verified_at": datetime.now(timezone.utc).isoformat(),
+                  "checks": {
+                      "source_head_get_utf8": True,
+                      "research_prefix_put_get": True,
+                  },
+              }
+              marker_bytes = (
+                  json.dumps(marker, ensure_ascii=False, sort_keys=True) + "\\n"
+              ).encode("utf-8")
+
+              s3.put_object(
+                  Bucket=BUCKET,
+                  Key=marker_key,
+                  Body=marker_bytes,
+                  ContentType="application/json",
+              )
+              saved = s3.get_object(Bucket=BUCKET, Key=marker_key)
+              try:
+                  round_trip = saved["Body"].read()
+              finally:
+                  saved["Body"].close()
+              if round_trip != marker_bytes:
+                  raise RuntimeError("The Research RustFS round-trip check failed")
+
+              return len(content), source_hash
+
+          def main() -> None:
+              verify_postgres()
+              print("PASS: Research PostgreSQL least-privilege checks and rolled-back INSERT probe")
+
+              source_bytes, _source_hash = verify_rustfs()
+              print("PASS: selected Markdown HEAD/GET, size and UTF-8 validation")
+              print("PASS: Research DEV prefix PUT/GET round trip")
+              print(f"Research DEV preflight succeeded for {SLOT_KEY} ({source_bytes} bytes)")
+
+          try:
+              main()
+          except Exception as exc:
+              print(f"Research DEV preflight failed ({type(exc).__name__})", file=sys.stderr)
+              sys.exit(1)
+          PY
+
+      - name: Stop tunnels and remove temporary secret material
+        if: always()
+        run: |
+          work_dir="$RUNNER_TEMP/research-preflight"
+          pid_file="$work_dir/stunnel.pid"
+          if [ -s "$pid_file" ]; then
+            pid="$(cat "$pid_file")"
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+              kill "$pid" 2>/dev/null || true
+            fi
+          fi
+          rm -f "$pid_file" "$work_dir/stunnel.conf" "$work_dir/research.psk" "$work_dir/stunnel.log"
