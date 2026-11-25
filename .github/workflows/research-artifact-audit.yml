@@ -227,6 +227,7 @@ jobs:
           
           def main() -> None:
               report: dict[str,Any]={"slot":SLOT}
+              stage="initialize_rustfs"
               try:
                   # Use the same S3 endpoint and CI credentials as the existing Corpus check.
                   s3=boto3.client(
@@ -242,6 +243,7 @@ jobs:
                           retries={"max_attempts":2,"mode":"standard"},
                       ),
                   )
+                  stage="read_original_markdown"
                   source_bucket=os.environ["CORPUS_RUSTFS_BUCKET"]
                   head=s3.head_object(Bucket=source_bucket,Key=SOURCE_KEY)
                   response=s3.get_object(Bucket=source_bucket,Key=SOURCE_KEY)
@@ -259,6 +261,7 @@ jobs:
                   }
           
                   # Inspect the exact DEV database only, with the PostgreSQL transaction forced read-only.
+                  stage="connect_postgresql"
                   with psycopg.connect(
                       os.environ["DATABASE_URL"],
                       connect_timeout=10,
@@ -277,7 +280,32 @@ jobs:
                           }
                           if db_name!="nooshare_dev" or read_only!="on":
                               raise RuntimeError("POSTGRESQL_ENVIRONMENT_GUARD")
-          
+
+                          stage="check_research_read_grants"
+                          cur.execute(
+                              """
+                              SELECT
+                                  has_schema_privilege(current_user,'research','USAGE'),
+                                  has_table_privilege(current_user,'research.document','SELECT'),
+                                  has_table_privilege(current_user,'research.document_version','SELECT'),
+                                  has_table_privilege(current_user,'research.frame','SELECT'),
+                                  has_table_privilege(current_user,'research.business_fact','SELECT'),
+                                  has_table_privilege(current_user,'research.fact_evidence','SELECT')
+                              """
+                          )
+                          grants=cur.fetchone()
+                          report["research_read_grants"]={
+                              "schema_usage":bool(grants[0]),
+                              "document_select":bool(grants[1]),
+                              "document_version_select":bool(grants[2]),
+                              "frame_select":bool(grants[3]),
+                              "business_fact_select":bool(grants[4]),
+                              "fact_evidence_select":bool(grants[5]),
+                          }
+                          if not all(bool(x) for x in grants):
+                              raise RuntimeError("RESEARCH_READ_GRANTS_MISSING")
+
+                          stage="read_target_document"
                           cur.execute("SELECT * FROM research.document WHERE slot_key=%s",(SLOT,))
                           doc_names=[d.name for d in cur.description]
                           docs=[dict(zip(doc_names,row)) for row in cur.fetchall()]
@@ -286,6 +314,7 @@ jobs:
                               raise RuntimeError("DOCUMENT_SLOT_NOT_UNIQUE")
                           document_id=str(docs[0]["document_id"])
           
+                          stage="read_target_document_version"
                           cur.execute(
                               "SELECT * FROM research.document_version WHERE document_id=%s",
                               (document_id,),
@@ -308,6 +337,7 @@ jobs:
                               "placeholder_uri": "placeholder" in str(version.get("source_uri","")).lower(),
                           }
           
+                          stage="read_h1_source_uri_population"
                           # Inspect the repaired population of H1-backed Research versions.
                           cur.execute(
                               """
@@ -346,6 +376,7 @@ jobs:
                               "published_object_size_matches":result_sizes,
                           }
           
+                          stage="read_h1_frames_and_assessments"
                           # All frames across the H1-backed version population.
                           frames=rows_by_ids(cur,"frame","document_version_id",h1_ids)
                           frame_ids=[str(r["frame_id"]) for r in frames]
@@ -422,6 +453,7 @@ jobs:
                               "task_types":dict(Counter(str(r.get("task_type") or "null") for r in task_rows)),
                           }
           
+                          stage="verify_target_frames_and_fact_evidence"
                           # Target report: verify Frame raw bytes and hashes, then all fact/evidence links.
                           target_frames=rows_by_ids(cur,"frame","document_version_id",[version_id])
                           frame_text={str(r["frame_id"]):str(r.get("text","")) for r in target_frames}
@@ -463,6 +495,7 @@ jobs:
                               "quotes_found_in_linked_frames":quote_found,
                           }
           
+                          stage="inspect_migration_tracking"
                           # Check Alembic tracking without creating or changing any schema object.
                           cur.execute("SELECT to_regclass('public.alembic_version')")
                           has_alembic=bool(cur.fetchone()[0])
@@ -483,6 +516,7 @@ jobs:
                               "no_migration_definitions_for_backfill_tables":True,
                           }
           
+                  stage="inspect_rustfs_research_prefixes"
                   # Check both the documented DEV bucket and the bucket named by the execution report.
                   # All operations below are HEAD/LIST/GET only.
                   bucket_results={}
@@ -538,7 +572,9 @@ jobs:
                   print(json.dumps({
                       "audit":"002452_2025_4",
                       "status":"BLOCKED",
+                      "stage":stage,
                       "error_type":type(exc).__name__,
+                      "permission_probe":report.get("research_read_grants"),
                   }))
                   sys.exit(1)
           
