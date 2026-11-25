@@ -281,29 +281,30 @@ jobs:
                           if db_name!="nooshare_dev" or read_only!="on":
                               raise RuntimeError("POSTGRESQL_ENVIRONMENT_GUARD")
 
-                          stage="check_research_read_grants"
+                          stage="check_research_schema_usage"
                           cur.execute(
-                              """
-                              SELECT
-                                  has_schema_privilege(current_user,'research','USAGE'),
-                                  has_table_privilege(current_user,'research.document','SELECT'),
-                                  has_table_privilege(current_user,'research.document_version','SELECT'),
-                                  has_table_privilege(current_user,'research.frame','SELECT'),
-                                  has_table_privilege(current_user,'research.business_fact','SELECT'),
-                                  has_table_privilege(current_user,'research.fact_evidence','SELECT')
-                              """
+                              "SELECT has_schema_privilege(current_user,'research','USAGE')"
                           )
-                          grants=cur.fetchone()
-                          report["research_read_grants"]={
-                              "schema_usage":bool(grants[0]),
-                              "document_select":bool(grants[1]),
-                              "document_version_select":bool(grants[2]),
-                              "frame_select":bool(grants[3]),
-                              "business_fact_select":bool(grants[4]),
-                              "fact_evidence_select":bool(grants[5]),
-                          }
-                          if not all(bool(x) for x in grants):
-                              raise RuntimeError("RESEARCH_READ_GRANTS_MISSING")
+                          schema_usage=bool(cur.fetchone()[0])
+                          report["research_read_grants"]={"schema_usage":schema_usage}
+                          if not schema_usage:
+                              raise RuntimeError("RESEARCH_SCHEMA_USAGE_MISSING")
+
+                          stage="check_research_table_select_grants"
+                          table_grants={}
+                          for table in (
+                              "document","document_version","task_run","frame",
+                              "frame_embedding","business_fact","fact_evidence",
+                              "scan_window","scan_window_attempt","frame_assessment"
+                          ):
+                              cur.execute(
+                                  "SELECT has_table_privilege(current_user,%s,'SELECT')",
+                                  (f"research.{table}",),
+                              )
+                              table_grants[table]=bool(cur.fetchone()[0])
+                          report["research_read_grants"].update(table_grants)
+                          if not all(table_grants.values()):
+                              raise RuntimeError("RESEARCH_TABLE_SELECT_MISSING")
 
                           stage="read_target_document"
                           cur.execute("SELECT * FROM research.document WHERE slot_key=%s",(SLOT,))
