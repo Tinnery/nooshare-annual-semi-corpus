@@ -301,7 +301,7 @@ jobs:
                               raise RuntimeError("The PostgreSQL permission probe was not rolled back")
                       conn.rollback()
 
-          def verify_rustfs() -> tuple[int, str]:
+          def verify_rustfs() -> tuple[int, str, str, str, str]:
               access_key = require_env("RESEARCH_RUSTFS_ACCESS_KEY")
               secret_key = require_env("RESEARCH_RUSTFS_SECRET_KEY")
 
@@ -379,16 +379,82 @@ jobs:
               if round_trip != marker_bytes:
                   raise RuntimeError("The Research RustFS round-trip check failed")
 
-              return len(content), source_hash
+              marker_hash = hashlib.sha256(marker_bytes).hexdigest()
+              return len(content), source_hash, source_key, marker_key, marker_hash
+
+          def persist_task_run(
+              source_bytes: int,
+              source_hash: str,
+              source_key: str,
+              marker_key: str,
+              marker_hash: str,
+          ) -> None:
+              from psycopg.types.json import Json
+
+              user = require_env("RESEARCH_PG_USER")
+              password = require_env("RESEARCH_PG_PASSWORD")
+              run_id = os.environ["GITHUB_RUN_ID"]
+              attempt = os.environ["GITHUB_RUN_ATTEMPT"]
+              task_run_id = f"ci-preflight-{run_id}-{attempt}"
+              config_hash = hashlib.sha256(
+                  f"research-preflight:v1:{SLOT_KEY}:{source_hash}".encode("utf-8")
+              ).hexdigest()
+              input_manifest = {
+                  "slot_key": SLOT_KEY,
+                  "source_key": source_key,
+                  "source_bytes": source_bytes,
+                  "source_sha256": source_hash,
+              }
+              output_manifest = {
+                  "rustfs_marker_key": marker_key,
+                  "rustfs_marker_sha256": marker_hash,
+                  "checks": [
+                      "upstream_registry_read",
+                      "source_markdown_head_get_utf8",
+                      "research_prefix_put_get",
+                      "research_task_run_insert",
+                  ],
+              }
+
+              with psycopg.connect(
+                  host="127.0.0.1",
+                  port=15432,
+                  dbname=DATABASE,
+                  user=user,
+                  password=password,
+                  connect_timeout=10,
+                  application_name="nooshare-corpus-research-preflight",
+              ) as conn:
+                  conn.execute(
+                      \"\"\"
+                      INSERT INTO research.task_run (
+                          task_run_id, task_type, task_version, input_manifest,
+                          config_hash, status, started_at, completed_at, output_manifest
+                      ) VALUES (
+                          %s, %s, %s, %s, %s, 'succeeded', now(), now(), %s
+                      )
+                      \"\"\",
+                      (
+                          task_run_id,
+                          "ci_research_preflight",
+                          "1.0.0",
+                          Json(input_manifest),
+                          config_hash,
+                          Json(output_manifest),
+                      ),
+                  )
 
           def main() -> None:
               verify_postgres()
-              print("PASS: Research PostgreSQL least-privilege checks and rolled-back INSERT probe")
+              print("PASS: Research PostgreSQL least-privilege checks and rolled-back INSERT/UPDATE probes")
 
-              source_bytes, _source_hash = verify_rustfs()
+              source_bytes, source_hash, source_key, marker_key, marker_hash = verify_rustfs()
               print("PASS: selected Markdown HEAD/GET, size and UTF-8 validation")
               print("PASS: Research DEV prefix PUT/GET round trip")
-              print(f"Research DEV preflight succeeded for {SLOT_KEY} ({source_bytes} bytes)")
+
+              persist_task_run(source_bytes, source_hash, source_key, marker_key, marker_hash)
+              print("PASS: persisted Research task_run preflight receipt")
+              print(f"Research DEV preflight succeeded for {SLOT_KEY}")
 
           try:
               main()
