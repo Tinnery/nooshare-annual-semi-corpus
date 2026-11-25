@@ -125,6 +125,431 @@ jobs:
             [ "$ready" -eq 1 ] || exit 1
           done
 
+      - name: Audit the named H1 backfill TaskRun and evidence integrity
+        run: |
+          set -a
+          # shellcheck disable=SC1090
+          source "$RUNNER_TEMP/research-audit/runtime.env"
+          set +a
+          uv run python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import unicodedata
+          from collections import Counter
+          from datetime import datetime, timezone
+          from typing import Any
+
+          import boto3
+          import botocore.config
+          import psycopg
+
+          TASK_ID = "taskrun_h1_corpus_backfill_20261125"
+          SLOT = "002452_2025_4"
+          SOURCE_KEY = "published/002452/002452_2025_4.md"
+
+          def fetch_rows(cur: Any, table: str, where: str = "", params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+              sql = f'SELECT * FROM research."{table}"'
+              if where:
+                  sql += " WHERE " + where
+              cur.execute(sql, params)
+              names = [d.name for d in cur.description]
+              return [dict(zip(names, row)) for row in cur.fetchall()]
+
+          def columns(cur: Any, table: str) -> list[dict[str, Any]]:
+              cur.execute(
+                  """
+                  SELECT column_name, data_type, udt_name, is_nullable, column_default
+                  FROM information_schema.columns
+                  WHERE table_schema='research' AND table_name=%s
+                  ORDER BY ordinal_position
+                  """,
+                  (table,),
+              )
+              return [
+                  {
+                      "name": r[0], "type": r[1], "udt": r[2],
+                      "nullable": r[3] == "YES", "default": r[4],
+                  }
+                  for r in cur.fetchall()
+              ]
+
+          def primary_key(cur: Any, table: str) -> list[str]:
+              cur.execute(
+                  """
+                  SELECT a.attname
+                  FROM pg_constraint c
+                  JOIN pg_class t ON t.oid=c.conrelid
+                  JOIN pg_namespace n ON n.oid=t.relnamespace
+                  JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS k(attnum,ord) ON true
+                  JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=k.attnum
+                  WHERE n.nspname='research' AND t.relname=%s AND c.contype='p'
+                  ORDER BY k.ord
+                  """,
+                  (table,),
+              )
+              return [r[0] for r in cur.fetchall()]
+
+          def foreign_keys(cur: Any, table: str | None = None) -> list[dict[str, str]]:
+              sql = """
+                  SELECT src.relname, sa.attname, dst.relname, da.attname,
+                         pg_get_constraintdef(c.oid)
+                  FROM pg_constraint c
+                  JOIN pg_class src ON src.oid=c.conrelid
+                  JOIN pg_namespace sn ON sn.oid=src.relnamespace
+                  JOIN pg_class dst ON dst.oid=c.confrelid
+                  JOIN pg_namespace dn ON dn.oid=dst.relnamespace
+                  JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS sk(attnum,ord) ON true
+                  JOIN LATERAL unnest(c.confkey) WITH ORDINALITY AS dk(attnum,ord) USING(ord)
+                  JOIN pg_attribute sa ON sa.attrelid=src.oid AND sa.attnum=sk.attnum
+                  JOIN pg_attribute da ON da.attrelid=dst.oid AND da.attnum=dk.attnum
+                  WHERE c.contype='f' AND sn.nspname='research' AND dn.nspname='research'
+              """
+              params: tuple[Any, ...] = ()
+              if table:
+                  sql += " AND src.relname=%s"
+                  params = (table,)
+              sql += " ORDER BY src.relname, c.conname, sk.ord"
+              cur.execute(sql, params)
+              return [
+                  {"source_table": r[0], "source_column": r[1],
+                   "target_table": r[2], "target_column": r[3], "definition": r[4]}
+                  for r in cur.fetchall()
+              ]
+
+          def index_definitions(cur: Any, table: str) -> list[str]:
+              cur.execute(
+                  """
+                  SELECT indexdef FROM pg_indexes
+                  WHERE schemaname='research' AND tablename=%s
+                  ORDER BY indexname
+                  """,
+                  (table,),
+              )
+              return [r[0] for r in cur.fetchall()]
+
+          def norm_text(value: str) -> str:
+              value = unicodedata.normalize("NFC", value)
+              return " ".join(value.split())
+
+          def count_occurrences(haystack: bytes, needle: bytes) -> int:
+              if not needle:
+                  return 0
+              count = 0
+              offset = 0
+              while True:
+                  pos = haystack.find(needle, offset)
+                  if pos < 0:
+                      return count
+                  count += 1
+                  offset = pos + 1
+
+          def main() -> None:
+              report: dict[str, Any] = {"task_run_id": TASK_ID, "slot": SLOT}
+              s3 = boto3.client(
+                  "s3",
+                  endpoint_url=__import__("os").environ["RUSTFS_ENDPOINT_URL"],
+                  aws_access_key_id=__import__("os").environ["RUSTFS_ACCESS_KEY"],
+                  aws_secret_access_key=__import__("os").environ["RUSTFS_SECRET_KEY"],
+                  region_name="us-east-1",
+                  config=botocore.config.Config(
+                      proxies={"http": None, "https": None},
+                      connect_timeout=10, read_timeout=60,
+                      retries={"max_attempts": 2, "mode": "standard"},
+                  ),
+              )
+              source_bucket = __import__("os").environ["CORPUS_RUSTFS_BUCKET"]
+              obj = s3.get_object(Bucket=source_bucket, Key=SOURCE_KEY)
+              try:
+                  source = obj["Body"].read()
+              finally:
+                  obj["Body"].close()
+              source_hash = hashlib.sha256(source).hexdigest()
+
+              with psycopg.connect(
+                  __import__("os").environ["DATABASE_URL"],
+                  connect_timeout=10,
+                  application_name="corpus-taskrun-h1-evidence-audit",
+              ) as conn:
+                  conn.read_only = True
+                  with conn.cursor() as cur:
+                      cur.execute("SELECT current_database(), current_user, current_setting('transaction_read_only')")
+                      db, role, ro = cur.fetchone()
+                      if db != "nooshare_dev" or ro != "on":
+                          raise RuntimeError("READ_ONLY_DEV_GUARD_FAILED")
+                      report["connection"] = {
+                          "database": db, "role": role, "transaction_read_only": ro
+                      }
+
+                      task_rows = fetch_rows(cur, "task_run", "task_run_id=%s", (TASK_ID,))
+                      if len(task_rows) != 1:
+                          raise RuntimeError(f"EXPECTED_ONE_TASK_RUN_GOT_{len(task_rows)}")
+                      task = task_rows[0]
+                      report["target_task_run"] = {
+                          key: task.get(key)
+                          for key in ("task_run_id", "task_type", "task_version", "status",
+                                      "attempt_count", "started_at", "completed_at",
+                                      "last_heartbeat_at", "created_at")
+                          if key in task
+                      }
+
+                      cur.execute(
+                          """
+                          SELECT task_run_id, task_type, task_version, status,
+                                 started_at, completed_at, last_heartbeat_at, created_at
+                          FROM research.task_run
+                          WHERE status='running'
+                          ORDER BY created_at, task_run_id
+                          """
+                      )
+                      running = cur.fetchall()
+                      report["running_task_runs"] = [
+                          {
+                              "task_run_id": r[0], "task_type": r[1], "task_version": r[2],
+                              "status": r[3], "started_at": r[4], "completed_at": r[5],
+                              "last_heartbeat_at": r[6], "created_at": r[7],
+                          }
+                          for r in running
+                      ]
+
+                      fk_all = foreign_keys(cur)
+                      table_info: dict[str, Any] = {}
+                      for table in ("scan_window", "scan_window_attempt", "frame_assessment"):
+                          if not fetch_rows(cur, table) and not columns(cur, table):
+                              table_info[table] = {"exists": False}
+                              continue
+                          table_info[table] = {
+                              "exists": True,
+                              "columns": columns(cur, table),
+                              "primary_key": primary_key(cur, table),
+                              "foreign_keys": [f for f in fk_all if f["source_table"] == table],
+                              "indexes": index_definitions(cur, table),
+                          }
+                      report["backfill_table_ddl"] = table_info
+
+                      # Resolve the backfill chain through actual FK constraints, not guessed identifiers.
+                      sw_run_fk = next(
+                          (f for f in fk_all if f["source_table"] == "scan_window"
+                           and f["target_table"] == "task_run"
+                           and f["target_column"] == "task_run_id"),
+                          None,
+                      )
+                      if sw_run_fk is None:
+                          raise RuntimeError("SCAN_WINDOW_HAS_NO_TASK_RUN_FOREIGN_KEY")
+                      windows = fetch_rows(
+                          cur, "scan_window",
+                          f'"{sw_run_fk["source_column"]}"=%s', (TASK_ID,)
+                      )
+                      window_pk = primary_key(cur, "scan_window")
+                      if not window_pk:
+                          raise RuntimeError("SCAN_WINDOW_PRIMARY_KEY_MISSING")
+                      window_ids = [r[window_pk[0]] for r in windows]
+
+                      attempt_fk = next(
+                          (f for f in fk_all if f["source_table"] == "scan_window_attempt"
+                           and f["target_table"] == "scan_window"
+                           and f["target_column"] == window_pk[0]),
+                          None,
+                      )
+                      if attempt_fk is None:
+                          raise RuntimeError("ATTEMPT_HAS_NO_SCAN_WINDOW_FOREIGN_KEY")
+                      attempts = fetch_rows(
+                          cur, "scan_window_attempt",
+                          f'"{attempt_fk["source_column"]}" = ANY(%s)', (window_ids,)
+                      ) if window_ids else []
+                      attempt_pk = primary_key(cur, "scan_window_attempt")
+                      if not attempt_pk:
+                          raise RuntimeError("SCAN_WINDOW_ATTEMPT_PRIMARY_KEY_MISSING")
+                      attempt_ids = [r[attempt_pk[0]] for r in attempts]
+
+                      assessment_fk = next(
+                          (f for f in fk_all if f["source_table"] == "frame_assessment"
+                           and f["target_table"] == "scan_window_attempt"
+                           and f["target_column"] == attempt_pk[0]),
+                          None,
+                      )
+                      if assessment_fk is None:
+                          raise RuntimeError("ASSESSMENT_HAS_NO_ATTEMPT_FOREIGN_KEY")
+                      assessments = fetch_rows(
+                          cur, "frame_assessment",
+                          f'"{assessment_fk["source_column"]}" = ANY(%s)', (attempt_ids,)
+                      ) if attempt_ids else []
+
+                      version_fk = next(
+                          (f for f in fk_all if f["source_table"] == "scan_window"
+                           and f["target_table"] == "document_version"
+                           and f["target_column"] == "document_version_id"),
+                          None,
+                      )
+                      version_ids: list[str] = []
+                      if version_fk:
+                          version_ids = sorted({
+                              str(r[version_fk["source_column"]])
+                              for r in windows if r.get(version_fk["source_column"]) is not None
+                          })
+
+                      frames: list[dict[str, Any]] = []
+                      if version_ids:
+                          frames = fetch_rows(
+                              cur, "frame", '"document_version_id" = ANY(%s)', (version_ids,)
+                          )
+                      frame_ids = {str(r["frame_id"]) for r in frames}
+                      assessed_frame_ids = {
+                          str(r["frame_id"]) for r in assessments if r.get("frame_id") is not None
+                      }
+                      acount = Counter(str(r.get("frame_id")) for r in assessments)
+                      report["task_scoped_backfill"] = {
+                          "scan_windows": len(windows),
+                          "distinct_window_ids": len(set(map(str, window_ids))),
+                          "scan_window_attempts": len(attempts),
+                          "distinct_attempt_ids": len(set(map(str, attempt_ids))),
+                          "document_versions": len(version_ids),
+                          "frames_in_window_versions": len(frames),
+                          "assessments": len(assessments),
+                          "assessed_distinct_frames": len(assessed_frame_ids),
+                          "assessment_frames_not_in_window_versions": len(assessed_frame_ids - frame_ids),
+                          "window_frames_without_assessment": len(frame_ids - assessed_frame_ids),
+                          "frames_with_multiple_target_assessments": sum(1 for n in acount.values() if n > 1),
+                          "decision_counts": dict(Counter(str(r.get("decision", r.get("screen_decision", "unknown"))) for r in assessments)),
+                          "confidence_half_count": sum(
+                              1 for r in assessments
+                              if any(k in r and r[k] is not None and float(r[k]) == 0.5
+                                     for k in ("confidence", "confidence_score"))
+                          ),
+                          "assessment_attempt_fk_column": assessment_fk["source_column"],
+                          "attempt_window_fk_column": attempt_fk["source_column"],
+                          "window_task_run_fk_column": sw_run_fk["source_column"],
+                      }
+
+                      # Target document raw-byte and evidence diagnostics.
+                      cur.execute("SELECT document_id FROM research.document WHERE slot_key=%s", (SLOT,))
+                      doc = cur.fetchone()
+                      if not doc:
+                          raise RuntimeError("TARGET_DOCUMENT_MISSING")
+                      cur.execute(
+                          "SELECT document_version_id, source_sha256, n_bytes, source_uri "
+                          "FROM research.document_version WHERE document_id=%s",
+                          (doc[0],),
+                      )
+                      versions = cur.fetchall()
+                      version = next((r for r in versions if r[1] == source_hash), None)
+                      if not version:
+                          raise RuntimeError("TARGET_DOCUMENT_VERSION_HASH_NOT_FOUND")
+                      version_id = version[0]
+                      target_frames = fetch_rows(
+                          cur, "frame", '"document_version_id"=%s', (version_id,)
+                      )
+                      target_frame_text = {str(r["frame_id"]): str(r["text"]) for r in target_frames}
+                      frame_diag = []
+                      for frame in target_frames:
+                          text_bytes = str(frame["text"]).encode("utf-8")
+                          start, end = int(frame["raw_start_byte"]), int(frame["raw_end_byte"])
+                          raw_slice = source[start:end] if 0 <= start <= end <= len(source) else b""
+                          found_at = source.find(text_bytes) if text_bytes else -1
+                          frame_diag.append({
+                              "span_length_matches_text_bytes": end - start == len(text_bytes),
+                              "raw_slice_equals_text": raw_slice == text_bytes,
+                              "raw_slice_hash_equals_frame_hash": hashlib.sha256(raw_slice).hexdigest() == str(frame["content_sha256"]),
+                              "text_found_in_source": found_at >= 0,
+                              "found_offset_matches_raw_start": found_at == start,
+                              "whitespace_normalized_slice_matches": norm_text(raw_slice.decode("utf-8", "replace")) == norm_text(str(frame["text"])),
+                          })
+                      facts = fetch_rows(
+                          cur, "business_fact", '"document_version_id"=%s', (version_id,)
+                      )
+                      fact_ids = [r["fact_id"] for r in facts]
+                      evidences = fetch_rows(
+                          cur, "fact_evidence", '"fact_id" = ANY(%s)', (fact_ids,)
+                      ) if fact_ids else []
+                      evidence_diag = []
+                      all_target_frame_text = list(target_frame_text.values())
+                      for ev in evidences:
+                          quote = str(ev.get("quote_text", ""))
+                          qb = quote.encode("utf-8")
+                          linked_text = target_frame_text.get(str(ev.get("frame_id")), "")
+                          in_linked_frame = bool(quote and quote in linked_text)
+                          in_any_frame = any(quote and quote in t for t in all_target_frame_text)
+                          in_source = bool(qb and source.find(qb) >= 0)
+                          in_linked_raw_span = False
+                          linked = next((f for f in target_frames if str(f["frame_id"]) == str(ev.get("frame_id"))), None)
+                          if linked:
+                              a, b = int(linked["raw_start_byte"]), int(linked["raw_end_byte"])
+                              in_linked_raw_span = bool(qb and 0 <= a <= b <= len(source) and source[a:b].find(qb) >= 0)
+                          evidence_diag.append({
+                              "quote_hash_matches": hashlib.sha256(qb).hexdigest() == str(ev.get("quote_hash", "")).lower(),
+                              "quote_in_linked_frame": in_linked_frame,
+                              "quote_in_any_target_frame": in_any_frame,
+                              "quote_in_original_source": in_source,
+                              "quote_in_linked_raw_span": in_linked_raw_span,
+                              "whitespace_normalized_quote_in_linked_frame": bool(quote and norm_text(quote) in norm_text(linked_text)),
+                          })
+                      report["target_document_integrity"] = {
+                          "source_bytes": len(source),
+                          "source_sha256_prefix": source_hash[:16],
+                          "document_version_count": len(versions),
+                          "frame_count": len(target_frames),
+                          "frame_hash_matches": sum(
+                              hashlib.sha256(str(f["text"]).encode("utf-8")).hexdigest()
+                              == str(f["content_sha256"]).lower() for f in target_frames
+                          ),
+                          "frame_span_diagnostics": {
+                              "span_length_matches_text_bytes": sum(x["span_length_matches_text_bytes"] for x in frame_diag),
+                              "raw_slice_equals_text": sum(x["raw_slice_equals_text"] for x in frame_diag),
+                              "raw_slice_hash_equals_frame_hash": sum(x["raw_slice_hash_equals_frame_hash"] for x in frame_diag),
+                              "text_found_in_source": sum(x["text_found_in_source"] for x in frame_diag),
+                              "found_offset_matches_raw_start": sum(x["found_offset_matches_raw_start"] for x in frame_diag),
+                              "whitespace_normalized_slice_matches": sum(x["whitespace_normalized_slice_matches"] for x in frame_diag),
+                          },
+                          "business_facts": len(facts),
+                          "fact_evidences": len(evidences),
+                          "evidence_diagnostics": {
+                              key: sum(x[key] for x in evidence_diag)
+                              for key in (
+                                  "quote_hash_matches", "quote_in_linked_frame",
+                                  "quote_in_any_target_frame", "quote_in_original_source",
+                                  "quote_in_linked_raw_span",
+                                  "whitespace_normalized_quote_in_linked_frame",
+                              )
+                          },
+                      }
+
+                      # Snapshot actual live DDL for the three drifted tables.
+                      cur.execute("SELECT version_num FROM public.alembic_version")
+                      alembic = [r[0] for r in cur.fetchall()]
+                      report["alembic_version"] = alembic
+                      ddl = {}
+                      for table in ("scan_window", "scan_window_attempt", "frame_assessment"):
+                          if table_info[table].get("exists"):
+                              cur.execute(
+                                  """
+                                  SELECT conname, contype, pg_get_constraintdef(oid)
+                                  FROM pg_constraint
+                                  WHERE conrelid = to_regclass(%s)
+                                  ORDER BY conname
+                                  """,
+                                  (f"research.{table}",),
+                              )
+                              constraints = [
+                                  {"name": r[0], "type": r[1], "definition": r[2]}
+                                  for r in cur.fetchall()
+                              ]
+                              ddl[table] = {
+                                  "columns": table_info[table]["columns"],
+                                  "constraints": constraints,
+                                  "indexes": table_info[table]["indexes"],
+                              }
+                      report["live_schema_ddl"] = ddl
+
+                      # Return the two running TaskRuns as operational facts, not as assumed failures.
+                      report["running_task_run_count"] = len(running)
+
+              print(json.dumps(report, ensure_ascii=False, sort_keys=True, default=str))
+          if __name__ == "__main__":
+              main()
+          PY
+
       - name: Run read-only Research output audit
         run: |
           set -a
@@ -613,431 +1038,6 @@ jobs:
           if __name__=="__main__":
               main()
           
-          PY
-
-      - name: Audit the named H1 backfill TaskRun and evidence integrity
-        run: |
-          set -a
-          # shellcheck disable=SC1090
-          source "$RUNNER_TEMP/research-audit/runtime.env"
-          set +a
-          uv run python - <<'PY'
-          from __future__ import annotations
-
-          import hashlib
-          import json
-          import re
-          import unicodedata
-          from collections import Counter
-          from datetime import datetime, timezone
-          from typing import Any
-
-          import boto3
-          import botocore.config
-          import psycopg
-
-          TASK_ID = "taskrun_h1_corpus_backfill_20261125"
-          SLOT = "002452_2025_4"
-          SOURCE_KEY = "published/002452/002452_2025_4.md"
-
-          def fetch_rows(cur: Any, table: str, where: str = "", params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
-              sql = f'SELECT * FROM research."{table}"'
-              if where:
-                  sql += " WHERE " + where
-              cur.execute(sql, params)
-              names = [d.name for d in cur.description]
-              return [dict(zip(names, row)) for row in cur.fetchall()]
-
-          def columns(cur: Any, table: str) -> list[dict[str, Any]]:
-              cur.execute(
-                  """
-                  SELECT column_name, data_type, udt_name, is_nullable, column_default
-                  FROM information_schema.columns
-                  WHERE table_schema='research' AND table_name=%s
-                  ORDER BY ordinal_position
-                  """,
-                  (table,),
-              )
-              return [
-                  {
-                      "name": r[0], "type": r[1], "udt": r[2],
-                      "nullable": r[3] == "YES", "default": r[4],
-                  }
-                  for r in cur.fetchall()
-              ]
-
-          def primary_key(cur: Any, table: str) -> list[str]:
-              cur.execute(
-                  """
-                  SELECT a.attname
-                  FROM pg_constraint c
-                  JOIN pg_class t ON t.oid=c.conrelid
-                  JOIN pg_namespace n ON n.oid=t.relnamespace
-                  JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS k(attnum,ord) ON true
-                  JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=k.attnum
-                  WHERE n.nspname='research' AND t.relname=%s AND c.contype='p'
-                  ORDER BY k.ord
-                  """,
-                  (table,),
-              )
-              return [r[0] for r in cur.fetchall()]
-
-          def foreign_keys(cur: Any, table: str | None = None) -> list[dict[str, str]]:
-              sql = """
-                  SELECT src.relname, sa.attname, dst.relname, da.attname,
-                         pg_get_constraintdef(c.oid)
-                  FROM pg_constraint c
-                  JOIN pg_class src ON src.oid=c.conrelid
-                  JOIN pg_namespace sn ON sn.oid=src.relnamespace
-                  JOIN pg_class dst ON dst.oid=c.confrelid
-                  JOIN pg_namespace dn ON dn.oid=dst.relnamespace
-                  JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS sk(attnum,ord) ON true
-                  JOIN LATERAL unnest(c.confkey) WITH ORDINALITY AS dk(attnum,ord) USING(ord)
-                  JOIN pg_attribute sa ON sa.attrelid=src.oid AND sa.attnum=sk.attnum
-                  JOIN pg_attribute da ON da.attrelid=dst.oid AND da.attnum=dk.attnum
-                  WHERE c.contype='f' AND sn.nspname='research' AND dn.nspname='research'
-              """
-              params: tuple[Any, ...] = ()
-              if table:
-                  sql += " AND src.relname=%s"
-                  params = (table,)
-              sql += " ORDER BY src.relname, c.conname, sk.ord"
-              cur.execute(sql, params)
-              return [
-                  {"source_table": r[0], "source_column": r[1],
-                   "target_table": r[2], "target_column": r[3], "definition": r[4]}
-                  for r in cur.fetchall()
-              ]
-
-          def index_definitions(cur: Any, table: str) -> list[str]:
-              cur.execute(
-                  """
-                  SELECT indexdef FROM pg_indexes
-                  WHERE schemaname='research' AND tablename=%s
-                  ORDER BY indexname
-                  """,
-                  (table,),
-              )
-              return [r[0] for r in cur.fetchall()]
-
-          def norm_text(value: str) -> str:
-              value = unicodedata.normalize("NFC", value)
-              return " ".join(value.split())
-
-          def count_occurrences(haystack: bytes, needle: bytes) -> int:
-              if not needle:
-                  return 0
-              count = 0
-              offset = 0
-              while True:
-                  pos = haystack.find(needle, offset)
-                  if pos < 0:
-                      return count
-                  count += 1
-                  offset = pos + 1
-
-          def main() -> None:
-              report: dict[str, Any] = {"task_run_id": TASK_ID, "slot": SLOT}
-              s3 = boto3.client(
-                  "s3",
-                  endpoint_url=__import__("os").environ["RUSTFS_ENDPOINT_URL"],
-                  aws_access_key_id=__import__("os").environ["RUSTFS_ACCESS_KEY"],
-                  aws_secret_access_key=__import__("os").environ["RUSTFS_SECRET_KEY"],
-                  region_name="us-east-1",
-                  config=botocore.config.Config(
-                      proxies={"http": None, "https": None},
-                      connect_timeout=10, read_timeout=60,
-                      retries={"max_attempts": 2, "mode": "standard"},
-                  ),
-              )
-              source_bucket = __import__("os").environ["CORPUS_RUSTFS_BUCKET"]
-              obj = s3.get_object(Bucket=source_bucket, Key=SOURCE_KEY)
-              try:
-                  source = obj["Body"].read()
-              finally:
-                  obj["Body"].close()
-              source_hash = hashlib.sha256(source).hexdigest()
-
-              with psycopg.connect(
-                  __import__("os").environ["DATABASE_URL"],
-                  connect_timeout=10,
-                  application_name="corpus-taskrun-h1-evidence-audit",
-              ) as conn:
-                  conn.read_only = True
-                  with conn.cursor() as cur:
-                      cur.execute("SELECT current_database(), current_user, current_setting('transaction_read_only')")
-                      db, role, ro = cur.fetchone()
-                      if db != "nooshare_dev" or ro != "on":
-                          raise RuntimeError("READ_ONLY_DEV_GUARD_FAILED")
-                      report["connection"] = {
-                          "database": db, "role": role, "transaction_read_only": ro
-                      }
-
-                      task_rows = fetch_rows(cur, "task_run", "task_run_id=%s", (TASK_ID,))
-                      if len(task_rows) != 1:
-                          raise RuntimeError(f"EXPECTED_ONE_TASK_RUN_GOT_{len(task_rows)}")
-                      task = task_rows[0]
-                      report["target_task_run"] = {
-                          key: task.get(key)
-                          for key in ("task_run_id", "task_type", "task_version", "status",
-                                      "attempt_count", "started_at", "completed_at",
-                                      "last_heartbeat_at", "created_at")
-                          if key in task
-                      }
-
-                      cur.execute(
-                          """
-                          SELECT task_run_id, task_type, task_version, status,
-                                 started_at, completed_at, last_heartbeat_at, created_at
-                          FROM research.task_run
-                          WHERE status='running'
-                          ORDER BY created_at, task_run_id
-                          """
-                      )
-                      running = cur.fetchall()
-                      report["running_task_runs"] = [
-                          {
-                              "task_run_id": r[0], "task_type": r[1], "task_version": r[2],
-                              "status": r[3], "started_at": r[4], "completed_at": r[5],
-                              "last_heartbeat_at": r[6], "created_at": r[7],
-                          }
-                          for r in running
-                      ]
-
-                      fk_all = foreign_keys(cur)
-                      table_info: dict[str, Any] = {}
-                      for table in ("scan_window", "scan_window_attempt", "frame_assessment"):
-                          if not fetch_rows(cur, table) and not columns(cur, table):
-                              table_info[table] = {"exists": False}
-                              continue
-                          table_info[table] = {
-                              "exists": True,
-                              "columns": columns(cur, table),
-                              "primary_key": primary_key(cur, table),
-                              "foreign_keys": [f for f in fk_all if f["source_table"] == table],
-                              "indexes": index_definitions(cur, table),
-                          }
-                      report["backfill_table_ddl"] = table_info
-
-                      # Resolve the backfill chain through actual FK constraints, not guessed identifiers.
-                      sw_run_fk = next(
-                          (f for f in fk_all if f["source_table"] == "scan_window"
-                           and f["target_table"] == "task_run"
-                           and f["target_column"] == "task_run_id"),
-                          None,
-                      )
-                      if sw_run_fk is None:
-                          raise RuntimeError("SCAN_WINDOW_HAS_NO_TASK_RUN_FOREIGN_KEY")
-                      windows = fetch_rows(
-                          cur, "scan_window",
-                          f'"{sw_run_fk["source_column"]}"=%s', (TASK_ID,)
-                      )
-                      window_pk = primary_key(cur, "scan_window")
-                      if not window_pk:
-                          raise RuntimeError("SCAN_WINDOW_PRIMARY_KEY_MISSING")
-                      window_ids = [r[window_pk[0]] for r in windows]
-
-                      attempt_fk = next(
-                          (f for f in fk_all if f["source_table"] == "scan_window_attempt"
-                           and f["target_table"] == "scan_window"
-                           and f["target_column"] == window_pk[0]),
-                          None,
-                      )
-                      if attempt_fk is None:
-                          raise RuntimeError("ATTEMPT_HAS_NO_SCAN_WINDOW_FOREIGN_KEY")
-                      attempts = fetch_rows(
-                          cur, "scan_window_attempt",
-                          f'"{attempt_fk["source_column"]}" = ANY(%s)', (window_ids,)
-                      ) if window_ids else []
-                      attempt_pk = primary_key(cur, "scan_window_attempt")
-                      if not attempt_pk:
-                          raise RuntimeError("SCAN_WINDOW_ATTEMPT_PRIMARY_KEY_MISSING")
-                      attempt_ids = [r[attempt_pk[0]] for r in attempts]
-
-                      assessment_fk = next(
-                          (f for f in fk_all if f["source_table"] == "frame_assessment"
-                           and f["target_table"] == "scan_window_attempt"
-                           and f["target_column"] == attempt_pk[0]),
-                          None,
-                      )
-                      if assessment_fk is None:
-                          raise RuntimeError("ASSESSMENT_HAS_NO_ATTEMPT_FOREIGN_KEY")
-                      assessments = fetch_rows(
-                          cur, "frame_assessment",
-                          f'"{assessment_fk["source_column"]}" = ANY(%s)', (attempt_ids,)
-                      ) if attempt_ids else []
-
-                      version_fk = next(
-                          (f for f in fk_all if f["source_table"] == "scan_window"
-                           and f["target_table"] == "document_version"
-                           and f["target_column"] == "document_version_id"),
-                          None,
-                      )
-                      version_ids: list[str] = []
-                      if version_fk:
-                          version_ids = sorted({
-                              str(r[version_fk["source_column"]])
-                              for r in windows if r.get(version_fk["source_column"]) is not None
-                          })
-
-                      frames: list[dict[str, Any]] = []
-                      if version_ids:
-                          frames = fetch_rows(
-                              cur, "frame", '"document_version_id" = ANY(%s)', (version_ids,)
-                          )
-                      frame_ids = {str(r["frame_id"]) for r in frames}
-                      assessed_frame_ids = {
-                          str(r["frame_id"]) for r in assessments if r.get("frame_id") is not None
-                      }
-                      acount = Counter(str(r.get("frame_id")) for r in assessments)
-                      report["task_scoped_backfill"] = {
-                          "scan_windows": len(windows),
-                          "distinct_window_ids": len(set(map(str, window_ids))),
-                          "scan_window_attempts": len(attempts),
-                          "distinct_attempt_ids": len(set(map(str, attempt_ids))),
-                          "document_versions": len(version_ids),
-                          "frames_in_window_versions": len(frames),
-                          "assessments": len(assessments),
-                          "assessed_distinct_frames": len(assessed_frame_ids),
-                          "assessment_frames_not_in_window_versions": len(assessed_frame_ids - frame_ids),
-                          "window_frames_without_assessment": len(frame_ids - assessed_frame_ids),
-                          "frames_with_multiple_target_assessments": sum(1 for n in acount.values() if n > 1),
-                          "decision_counts": dict(Counter(str(r.get("decision", r.get("screen_decision", "unknown"))) for r in assessments)),
-                          "confidence_half_count": sum(
-                              1 for r in assessments
-                              if any(k in r and r[k] is not None and float(r[k]) == 0.5
-                                     for k in ("confidence", "confidence_score"))
-                          ),
-                          "assessment_attempt_fk_column": assessment_fk["source_column"],
-                          "attempt_window_fk_column": attempt_fk["source_column"],
-                          "window_task_run_fk_column": sw_run_fk["source_column"],
-                      }
-
-                      # Target document raw-byte and evidence diagnostics.
-                      cur.execute("SELECT document_id FROM research.document WHERE slot_key=%s", (SLOT,))
-                      doc = cur.fetchone()
-                      if not doc:
-                          raise RuntimeError("TARGET_DOCUMENT_MISSING")
-                      cur.execute(
-                          "SELECT document_version_id, source_sha256, n_bytes, source_uri "
-                          "FROM research.document_version WHERE document_id=%s",
-                          (doc[0],),
-                      )
-                      versions = cur.fetchall()
-                      version = next((r for r in versions if r[1] == source_hash), None)
-                      if not version:
-                          raise RuntimeError("TARGET_DOCUMENT_VERSION_HASH_NOT_FOUND")
-                      version_id = version[0]
-                      target_frames = fetch_rows(
-                          cur, "frame", '"document_version_id"=%s', (version_id,)
-                      )
-                      target_frame_text = {str(r["frame_id"]): str(r["text"]) for r in target_frames}
-                      frame_diag = []
-                      for frame in target_frames:
-                          text_bytes = str(frame["text"]).encode("utf-8")
-                          start, end = int(frame["raw_start_byte"]), int(frame["raw_end_byte"])
-                          raw_slice = source[start:end] if 0 <= start <= end <= len(source) else b""
-                          found_at = source.find(text_bytes) if text_bytes else -1
-                          frame_diag.append({
-                              "span_length_matches_text_bytes": end - start == len(text_bytes),
-                              "raw_slice_equals_text": raw_slice == text_bytes,
-                              "raw_slice_hash_equals_frame_hash": hashlib.sha256(raw_slice).hexdigest() == str(frame["content_sha256"]),
-                              "text_found_in_source": found_at >= 0,
-                              "found_offset_matches_raw_start": found_at == start,
-                              "whitespace_normalized_slice_matches": norm_text(raw_slice.decode("utf-8", "replace")) == norm_text(str(frame["text"])),
-                          })
-                      facts = fetch_rows(
-                          cur, "business_fact", '"document_version_id"=%s', (version_id,)
-                      )
-                      fact_ids = [r["fact_id"] for r in facts]
-                      evidences = fetch_rows(
-                          cur, "fact_evidence", '"fact_id" = ANY(%s)', (fact_ids,)
-                      ) if fact_ids else []
-                      evidence_diag = []
-                      all_target_frame_text = list(target_frame_text.values())
-                      for ev in evidences:
-                          quote = str(ev.get("quote_text", ""))
-                          qb = quote.encode("utf-8")
-                          linked_text = target_frame_text.get(str(ev.get("frame_id")), "")
-                          in_linked_frame = bool(quote and quote in linked_text)
-                          in_any_frame = any(quote and quote in t for t in all_target_frame_text)
-                          in_source = bool(qb and source.find(qb) >= 0)
-                          in_linked_raw_span = False
-                          linked = next((f for f in target_frames if str(f["frame_id"]) == str(ev.get("frame_id"))), None)
-                          if linked:
-                              a, b = int(linked["raw_start_byte"]), int(linked["raw_end_byte"])
-                              in_linked_raw_span = bool(qb and 0 <= a <= b <= len(source) and source[a:b].find(qb) >= 0)
-                          evidence_diag.append({
-                              "quote_hash_matches": hashlib.sha256(qb).hexdigest() == str(ev.get("quote_hash", "")).lower(),
-                              "quote_in_linked_frame": in_linked_frame,
-                              "quote_in_any_target_frame": in_any_frame,
-                              "quote_in_original_source": in_source,
-                              "quote_in_linked_raw_span": in_linked_raw_span,
-                              "whitespace_normalized_quote_in_linked_frame": bool(quote and norm_text(quote) in norm_text(linked_text)),
-                          })
-                      report["target_document_integrity"] = {
-                          "source_bytes": len(source),
-                          "source_sha256_prefix": source_hash[:16],
-                          "document_version_count": len(versions),
-                          "frame_count": len(target_frames),
-                          "frame_hash_matches": sum(
-                              hashlib.sha256(str(f["text"]).encode("utf-8")).hexdigest()
-                              == str(f["content_sha256"]).lower() for f in target_frames
-                          ),
-                          "frame_span_diagnostics": {
-                              "span_length_matches_text_bytes": sum(x["span_length_matches_text_bytes"] for x in frame_diag),
-                              "raw_slice_equals_text": sum(x["raw_slice_equals_text"] for x in frame_diag),
-                              "raw_slice_hash_equals_frame_hash": sum(x["raw_slice_hash_equals_frame_hash"] for x in frame_diag),
-                              "text_found_in_source": sum(x["text_found_in_source"] for x in frame_diag),
-                              "found_offset_matches_raw_start": sum(x["found_offset_matches_raw_start"] for x in frame_diag),
-                              "whitespace_normalized_slice_matches": sum(x["whitespace_normalized_slice_matches"] for x in frame_diag),
-                          },
-                          "business_facts": len(facts),
-                          "fact_evidences": len(evidences),
-                          "evidence_diagnostics": {
-                              key: sum(x[key] for x in evidence_diag)
-                              for key in (
-                                  "quote_hash_matches", "quote_in_linked_frame",
-                                  "quote_in_any_target_frame", "quote_in_original_source",
-                                  "quote_in_linked_raw_span",
-                                  "whitespace_normalized_quote_in_linked_frame",
-                              )
-                          },
-                      }
-
-                      # Snapshot actual live DDL for the three drifted tables.
-                      cur.execute("SELECT version_num FROM public.alembic_version")
-                      alembic = [r[0] for r in cur.fetchall()]
-                      report["alembic_version"] = alembic
-                      ddl = {}
-                      for table in ("scan_window", "scan_window_attempt", "frame_assessment"):
-                          if table_info[table].get("exists"):
-                              cur.execute(
-                                  """
-                                  SELECT conname, contype, pg_get_constraintdef(oid)
-                                  FROM pg_constraint
-                                  WHERE conrelid = to_regclass(%s)
-                                  ORDER BY conname
-                                  """,
-                                  (f"research.{table}",),
-                              )
-                              constraints = [
-                                  {"name": r[0], "type": r[1], "definition": r[2]}
-                                  for r in cur.fetchall()
-                              ]
-                              ddl[table] = {
-                                  "columns": table_info[table]["columns"],
-                                  "constraints": constraints,
-                                  "indexes": table_info[table]["indexes"],
-                              }
-                      report["live_schema_ddl"] = ddl
-
-                      # Return the two running TaskRuns as operational facts, not as assumed failures.
-                      report["running_task_run_count"] = len(running)
-
-              print(json.dumps(report, ensure_ascii=False, sort_keys=True, default=str))
-          if __name__ == "__main__":
-              main()
           PY
 
       - name: Stop tunnel and remove secret material
