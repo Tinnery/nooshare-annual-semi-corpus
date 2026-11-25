@@ -45,7 +45,7 @@ jobs:
     # Pull requests are excluded: fork PRs must never receive secrets, and
     # this job requires real infrastructure credentials. Re-evaluate if a
     # second writer or an untrusted contributor is ever added.
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # NOOSHARE_INFRA is intentionally NOT set at job level: only the single
