@@ -68,7 +68,7 @@ jobs:
           os.chmod(work_dir, 0o700)
 
           psk_file = work_dir / "research.psk"
-          psk_file.write_text(psk + "\\n", encoding="utf-8")
+          psk_file.write_text(psk + "\n", encoding="utf-8")
           os.chmod(psk_file, 0o600)
 
           pid_file = work_dir / "stunnel.pid"
@@ -95,7 +95,7 @@ jobs:
               "PSKsecrets = " + str(psk_file),
               "",
           ]
-          conf_file.write_text("\\n".join(conf_lines), encoding="utf-8")
+          conf_file.write_text("\n".join(conf_lines), encoding="utf-8")
           os.chmod(conf_file, 0o600)
           PY
 
@@ -235,13 +235,36 @@ jobs:
                           )
                           if not cur.fetchone()[0]:
                               raise RuntimeError("The Research role cannot read the report registry")
-                      for privilege in ("INSERT", "UPDATE", "DELETE", "TRUNCATE"):
-                          cur.execute(
-                              "SELECT has_table_privilege(current_user, %s, %s)",
-                              (upstream_table, privilege),
+                      cur.execute(
+                          """
+                          SELECT
+                              has_schema_privilege(current_user, 'annual_semi', 'CREATE'),
+                              has_schema_privilege(current_user, 'iwen', 'CREATE')
+                          """
+                      )
+                      if any(cur.fetchone()):
+                          raise RuntimeError("The Research role can create objects in upstream schemas")
+
+                      cur.execute(
+                          """
+                          SELECT EXISTS (
+                              SELECT 1
+                              FROM pg_catalog.pg_class AS c
+                              JOIN pg_catalog.pg_namespace AS n
+                                ON n.oid = c.relnamespace
+                              WHERE n.nspname IN ('annual_semi', 'iwen')
+                                AND c.relkind IN ('r', 'p')
+                                AND (
+                                  has_table_privilege(current_user, c.oid, 'INSERT')
+                                  OR has_table_privilege(current_user, c.oid, 'UPDATE')
+                                  OR has_table_privilege(current_user, c.oid, 'DELETE')
+                                  OR has_table_privilege(current_user, c.oid, 'TRUNCATE')
+                                )
                           )
-                          if cur.fetchone()[0]:
-                              raise RuntimeError("The Research role can write upstream corpus data")
+                          """
+                      )
+                      if cur.fetchone()[0]:
+                          raise RuntimeError("The Research role can write upstream corpus tables")
 
                       cur.execute(
                           "SELECT source_uri FROM annual_semi.reconciled_report WHERE slot_key = %s",
@@ -269,13 +292,13 @@ jobs:
                           (probe_id, "ci_research_preflight", "1", config_hash),
                       )
                       conn.rollback()
-                      cur = conn.cursor()
-                      cur.execute(
-                          "SELECT 1 FROM research.task_run WHERE task_run_id = %s",
-                          (probe_id,),
-                      )
-                      if cur.fetchone() is not None:
-                          raise RuntimeError("The PostgreSQL permission probe was not rolled back")
+                      with conn.cursor() as probe_cur:
+                          probe_cur.execute(
+                              "SELECT 1 FROM research.task_run WHERE task_run_id = %s",
+                              (probe_id,),
+                          )
+                          if probe_cur.fetchone() is not None:
+                              raise RuntimeError("The PostgreSQL permission probe was not rolled back")
                       conn.rollback()
 
           def verify_rustfs() -> tuple[int, str]:
@@ -296,7 +319,7 @@ jobs:
                   ),
               )
 
-              match = re.fullmatch(r"(\\d{6})_(\\d{4})_([24])", SLOT_KEY)
+              match = re.fullmatch(r"(\d{6})_(\d{4})_([24])", SLOT_KEY)
               if match is None:
                   raise RuntimeError("The fixed report slot key is invalid")
               code, year, period = match.groups()
@@ -336,13 +359,10 @@ jobs:
                       "commit": os.environ["GITHUB_SHA"],
                   },
                   "verified_at": datetime.now(timezone.utc).isoformat(),
-                  "checks": {
-                      "source_head_get_utf8": True,
-                      "research_prefix_put_get": True,
-                  },
+                  "purpose": "scoped Research RustFS PutObject/GetObject permission probe",
               }
               marker_bytes = (
-                  json.dumps(marker, ensure_ascii=False, sort_keys=True) + "\\n"
+                  json.dumps(marker, ensure_ascii=False, sort_keys=True) + "\n"
               ).encode("utf-8")
 
               s3.put_object(
