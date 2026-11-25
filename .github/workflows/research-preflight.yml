@@ -224,13 +224,17 @@ jobs:
                       cur.execute("SELECT to_regclass(%s)", (upstream_table,))
                       if cur.fetchone()[0] is None:
                           raise RuntimeError("The upstream report registry is unavailable")
-                      for privilege in ("SELECT",):
-                          cur.execute(
-                              "SELECT has_table_privilege(current_user, %s, %s)",
-                              (upstream_table, privilege),
-                          )
-                          if not cur.fetchone()[0]:
-                              raise RuntimeError("The Research role cannot read the report registry")
+                      cur.execute(
+                          """
+                          SELECT
+                              has_schema_privilege(current_user, 'annual_semi', 'USAGE'),
+                              has_table_privilege(current_user, %s, 'SELECT')
+                          """,
+                          (upstream_table,),
+                      )
+                      upstream_schema_usage, upstream_select = cur.fetchone()
+                      if not upstream_schema_usage or not upstream_select:
+                          raise RuntimeError("The Research role cannot read the report registry")
                       cur.execute(
                           """
                           SELECT EXISTS (
